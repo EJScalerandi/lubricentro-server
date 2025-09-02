@@ -289,6 +289,6 @@ const port = Number(process.env.PORT || 4000)
 export default app
 
 // Solo escuchar en local
-if (!process.env.VERCEL) {
-  app.listen(port, () => console.log(`API http://localhost:${port}`))
-}
+// if (!process.env.VERCEL) {
+//   app.listen(port, () => console.log(`API http://localhost:${port}`))
+// }
