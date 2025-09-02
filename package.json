@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node server.js"
   },
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": "20.x"
+  },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",
     "cors": "^2.8.5",
