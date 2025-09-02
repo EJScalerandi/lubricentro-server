@@ -1,36 +1,30 @@
-generator client {
-  provider = "prisma-client-js"
-}
-
-datasource db {
-  provider = "sqlite"
-  url      = env("DATABASE_URL")
-}
+generator client { provider = "prisma-client-js" }
+datasource db { provider = "sqlite"; url = env("DATABASE_URL") }
 
 model Client {
-  id        Int       @id @default(autoincrement())
+  id        Int        @id @default(autoincrement())
   name      String
-  phone     String    @unique
+  phone     String     @unique
   birthday  DateTime?
   notes     String?
   vehicles  Vehicle[]
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  Service   Service[]
+  services  Service[]   // ← lado opuesto de Service.client
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
 }
 
 model Category {
-  id          Int       @id @default(autoincrement())
-  name        String    @unique // ALTA | MEDIA | BAJA
+  id          Int        @id @default(autoincrement())
+  name        String     @unique   // ALTA | MEDIA | BAJA | etc.
   everyDays   Int
   description String?
   vehicles    Vehicle[]
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
 }
 
 model Vehicle {
-  plate        String    @id
+  plate        String     @id
   clientId     Int
   brand        String?
   model        String?
@@ -39,10 +33,10 @@ model Vehicle {
   lastService  DateTime?
   nextReminder DateTime?
   services     Service[]
-  client       Client    @relation(fields: [clientId], references: [id])
-  category     Category? @relation(fields: [categoryId], references: [id])
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  client       Client     @relation(fields: [clientId], references: [id])
+  category     Category?  @relation(fields: [categoryId], references: [id])
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
 
   @@index([clientId])
   @@index([categoryId])
@@ -57,8 +51,8 @@ model Service {
   summary   String?
   createdAt DateTime @default(now())
 
-  vehicle Vehicle @relation(fields: [vehicleId], references: [plate])
-  client  Client  @relation(fields: [clientId], references: [id])
+  vehicle   Vehicle @relation(fields: [vehicleId], references: [plate])
+  client    Client  @relation(fields: [clientId], references: [id])  // ← OK
 
   @@index([vehicleId])
   @@index([clientId, date])
