@@ -11,7 +11,8 @@ const app = express()
 const upload = multer({ storage: multer.memoryStorage() })
 
 app.use(express.json())
-app.use(cors({ origin: process.env.CLIENT_ORIGIN || '*' }))
+app.use(cors({ origin: '*' }))
+
 
 // ---------- Utils ----------
 const addDays = (d, n) => new Date(new Date(d).getTime() + n * 86400000)
