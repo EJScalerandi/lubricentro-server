@@ -3,3 +3,14 @@ node_modules
 .env
 
 /generated/prisma
+# Node
+node_modules/
+npm-debug.log
+.env
+dev.db
+
+# Prisma
+prisma/migrations/
+
+# Logs
+*.log
