@@ -10,9 +10,17 @@ const prisma = new PrismaClient()
 const app = express()
 const upload = multer({ storage: multer.memoryStorage() })
 
+// ---- CORS (permite CLIENT_ORIGIN y fallback a *) ----
+const allowed = (process.env.CLIENT_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean)
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true) // curl/postman
+    if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true)
+    if (process.env.NODE_ENV !== 'production') return cb(null, true) // en dev, relajado
+    return cb(new Error('Not allowed by CORS: ' + origin))
+  }
+}))
 app.use(express.json())
-app.use(cors({ origin: '*' }))
-
 
 // ---------- Utils ----------
 const addDays = (d, n) => new Date(new Date(d).getTime() + n * 86400000)
@@ -68,7 +76,7 @@ async function computeVehicleCategory(plate) {
     desired = diffDays <= 30 ? 'ALTA' : diffDays <= 90 ? 'MEDIA' : 'BAJA'
   }
   const cat = await prisma.category.findUnique({ where: { name: desired } })
-  if (!cat) return null // si no hay categorías, no rompe
+  if (!cat) return null
   const lastService = services[0]?.date ?? null
   const nextReminder = lastService ? addDays(lastService, cat.everyDays) : null
   await prisma.vehicle.update({ where: { plate }, data: { categoryId: cat.id, lastService, nextReminder } })
@@ -125,9 +133,14 @@ async function runScheduler({ simulate = false } = {}) {
   }
   return { sent, errors }
 }
-cron.schedule(process.env.CRON_EXPR || '0 9 * * *', () => {
-  runScheduler().then(r => console.log('[CRON]', r)).catch(console.error)
-})
+
+// En Vercel no hay proceso persistente → no agendamos cron.
+// Usá un Cron Job de Vercel que pegue a /api/scheduler/run
+if (!process.env.VERCEL) {
+  cron.schedule(process.env.CRON_EXPR || '0 9 * * *', () => {
+    runScheduler().then(r => console.log('[CRON]', r)).catch(console.error)
+  })
+}
 
 // ---------- Endpoints ----------
 app.get('/api/health', (_, res) => res.json({ ok: true }))
@@ -192,7 +205,7 @@ app.post('/api/vehicles/:plate/services', async (req, res) => {
   res.status(201).json(s)
 })
 
-// Import CSV (lo dejo por si después querés usarlo; no hace nada si no llamás)
+// Import CSV
 app.post('/api/import/csv', upload.single('file'), async (req,res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Archivo CSV requerido (file)' })
@@ -263,18 +276,19 @@ app.post('/api/import/csv', upload.single('file'), async (req,res) => {
   } catch (e) { console.error('[IMPORT]', e); res.status(400).json({ error: String(e.message || e) }) }
 })
 
-// Scheduler manual
+// Scheduler manual (compatible con Vercel Cron)
 app.post('/api/scheduler/run', async (req, res) => {
   const out = await runScheduler({ simulate: req.query.simulate === 'true' })
   res.json(out)
 })
 
-// ---------- Arranque ----------
+// ---------- Export para Vercel + arranque local ----------
 const port = Number(process.env.PORT || 4000)
-const boot = async () => {
-  if (process.env.SEED_BASE_CATEGORIES === 'true') {
-    await ensureBaseCategories() // solo si querés seed
-  }
+
+// Exporto para Serverless (Vercel)
+export default app
+
+// Solo escuchar en local
+if (!process.env.VERCEL) {
   app.listen(port, () => console.log(`API http://localhost:${port}`))
 }
-boot()
