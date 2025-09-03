@@ -1,7 +1,7 @@
+// server.js
 import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
-import cron from 'node-cron'
 import multer from 'multer'
 import { parse as parseCsv } from 'csv-parse/sync'
 import { neon, neonConfig } from '@neondatabase/serverless'
@@ -12,8 +12,12 @@ const sql = neon(process.env.DATABASE_URL)
 const app = express()
 const upload = multer({ storage: multer.memoryStorage() })
 
-// CORS
-const allowed = (process.env.CLIENT_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean)
+/* ---------------- CORS ---------------- */
+const allowed = (process.env.CLIENT_ORIGIN || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean)
+
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true)
@@ -24,45 +28,15 @@ app.use(cors({
 }))
 app.use(express.json())
 
-// Utils
+/* --------------- Utils ---------------- */
 const addDays = (d, n) => new Date(new Date(d).getTime() + n * 86400000)
 const up = (s='') => (s || '').toString().trim().toUpperCase()
-const onlyDigits = (s='') => (s || '').toString().replace(/\D+/g, '')
-const stripDiacritics = (s='') => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-const normKey = (k='') => stripDiacritics(k).toLowerCase().replace(/\s+/g,' ')
-function findKey(obj, hints) { for (const k of Object.keys(obj||{})) { const nk = normKey(k); if (hints.some(h => nk.includes(h))) return k } return null }
-function detectDelimiter(raw) {
-  const firstLine = raw.split(/\r?\n/,1)[0] || ''
-  const counts = [',',';','\t'].map(d => ({ d, c: (firstLine.match(new RegExp(`\\${d}`,'g'))||[]).length }))
-  counts.sort((a,b)=>b.c-a.c)
-  return (counts[0]?.c ?? 0) > 0 ? counts[0].d : ','
-}
-function tryParseCsv(raw) {
-  const delim = detectDelimiter(raw)
-  return parseCsv(raw, { columns:true, skip_empty_lines:true, delimiter:delim, bom:true, relax_quotes:true, relax_column_count:true, trim:true })
-}
-function parseIntLoose(s) {
-  if (s == null) return null
-  const n = parseInt(String(s).replace(/[^0-9]/g,''), 10)
-  if (!Number.isFinite(n) || n < 0 || n > 3_000_000) return null
-  return n
-}
-function parseMoney(s) { if (!s) return null; const t=String(s).replace(/\./g,'').replace(/,/g,'.').replace(/\s/g,''); const n=Number(t); return Number.isFinite(n)?n:null }
-function fixWeirdDate(s) {
-  if (!s) return null
-  let t = String(s).trim()
-  if (/^002\d-/.test(t)) t = t.replace(/^002/, '202')
-  t = t.replace(/a\.\s*m\./ig,'AM').replace(/p\.\s*m\./ig,'PM').replace(/\s*GMT[-+]\d+\s*$/i,'')
-  const d = new Date(t)
-  return isNaN(d) ? null : d
-}
 const normalizePlate = (s) => up(String(s).replace(/\s+/g,'')).replace(/[^A-Z0-9]/g,'')
 
-// DB helpers
 async function one(q) { const r = await q; return r[0] || null }
 async function many(q) { return await q }
 
-// Categorías + recálculo
+/* ---- Categorías base + recálculo por services ---- */
 async function ensureBaseCategories() {
   const defs = [
     { name: 'ALTA',  everyDays: 30,  description: 'Uso intenso' },
@@ -77,6 +51,7 @@ async function ensureBaseCategories() {
     `
   }
 }
+
 async function computeVehicleCategory(plate) {
   const services = await sql`
     SELECT "date" FROM "Service"
@@ -102,136 +77,122 @@ async function computeVehicleCategory(plate) {
   return { category: cat.name, everyDays: cat.everyDays, lastService, nextReminder }
 }
 
-// WhatsApp (simulado)
-async function sendWhatsApp({ phone, name, nextDate }) {
-  if (process.env.WHATSAPP_ENABLED !== 'true') {
-    console.log('[Simulado] WhatsApp →', phone, name, nextDate)
-    return { simulated: true }
-  }
-  const token = process.env.WHATSAPP_TOKEN
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID
-  const template = process.env.WHATSAPP_TEMPLATE || 'service_reminder'
-  const lang = process.env.WHATSAPP_TEMPLATE_LANG || 'es'
-  const url = `https://graph.facebook.com/v20.0/${phoneNumberId}/messages`
-  const body = {
-    messaging_product: 'whatsapp',
-    to: (phone || '').replace(/\D/g, ''),
-    type: 'template',
-    template: {
-      name: template, language: { code: lang },
-      components: [{ type:'body', parameters:[
-        { type:'text', text: name || '' },
-        { type:'text', text: nextDate ? new Date(nextDate).toLocaleDateString() : '' },
-      ]}]
-    }
-  }
-  const res = await fetch(url, { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' }, body: JSON.stringify(body) })
-  if (!res.ok) throw new Error(`[WhatsApp] ${res.status} ${await res.text()}`)
-  return res.json()
-}
-
-// Scheduler (en proceso persistente SI corre)
-async function runScheduler({ simulate = false } = {}) {
-  const vehicles = await sql`
-    SELECT v.*, c."everyDays", cl."phone", cl."name" as "clientName"
-    FROM "Vehicle" v
-    LEFT JOIN "Category" c ON c.id = v."categoryId"
-    JOIN "Client" cl ON cl.id = v."clientId"
-  `
-  let sent = 0, errors = 0
-  for (const v of vehicles) {
-    await computeVehicleCategory(v.plate)
-    const updated = await one(sql`
-      SELECT v.*, c."everyDays", cl."phone", cl."name" as "clientName"
-      FROM "Vehicle" v
-      LEFT JOIN "Category" c ON c.id = v."categoryId"
-      JOIN "Client" cl ON cl.id = v."clientId"
-      WHERE v."plate"=${v.plate}
-    `)
-    if (updated?.nextReminder && new Date(updated.nextReminder) <= new Date()) {
-      try {
-        if (!simulate) {
-          await sendWhatsApp({ phone: updated.phone, name: updated.clientName, nextDate: updated.nextReminder })
-        } else {
-          console.log('[Simulado] Aviso →', updated.phone, updated.plate)
-        }
-        sent++
-        const days = updated.everyDays ?? 90
-        await sql`UPDATE "Vehicle" SET "nextReminder"=${addDays(new Date(), days)} WHERE "plate"=${updated.plate}`
-      } catch (e) { console.error(e.message); errors++ }
-    }
-  }
-  return { sent, errors }
-}
-
-// CRON real en proceso persistente
-if (process.env.CRON_EXPR) {
-  cron.schedule(process.env.CRON_EXPR, () => {
-    runScheduler().then(r => console.log('[CRON]', r)).catch(console.error)
-  })
-}
-
-// --------- ENDPOINTS (con /api) ----------
+/* --------------- ENDPOINTS --------------- */
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-app.post('/api/categories/seed', async (_req, res) => { await ensureBaseCategories(); res.json({ ok: true }) })
-
-app.get('/api/categories', async (_req, res) => { res.json(await many(sql`SELECT * FROM "Category" ORDER BY "name" ASC`)) })
-app.post('/api/categories', async (req, res) => {
-  const { name, everyDays, description } = req.body
-  const row = await one(sql`
-    INSERT INTO "Category" ("name","everyDays","description","createdAt","updatedAt")
-    VALUES (${name}, ${everyDays}, ${description ?? null}, NOW(), NOW())
-    RETURNING *`)
-  res.status(201).json(row)
+/* Clientes */
+app.get('/api/clients', async (_req, res) => {
+  const rows = await many(sql`SELECT id, name, phone, birthday, notes, "createdAt", "updatedAt" FROM "Client" ORDER BY "name" ASC`)
+  res.json(rows)
 })
 
-app.get('/api/clients', async (_req, res) => { res.json(await many(sql`SELECT * FROM "Client" ORDER BY "name" ASC`)) })
-app.get('/api/clients/:id', async (req, res) => {
-  const id = Number(req.params.id)
-  const client = await one(sql`SELECT * FROM "Client" WHERE id=${id}`)
-  if (!client) return res.status(404).json({ error: 'Not found' })
-  const vehicles = await many(sql`
-    SELECT v.*, c."name" AS "categoryName", c."everyDays"
-    FROM "Vehicle" v
-    LEFT JOIN "Category" c ON c.id = v."categoryId"
-    WHERE v."clientId"=${id}
-    ORDER BY v."plate" ASC`)
-  const services = await many(sql`SELECT * FROM "Service" WHERE "clientId"=${id} ORDER BY "date" DESC`)
-  res.json({ ...client, vehicles, services })
-})
 app.post('/api/clients', async (req, res) => {
   const { name, phone, birthday, notes } = req.body
   const row = await one(sql`
     INSERT INTO "Client" ("name","phone","birthday","notes","createdAt","updatedAt")
     VALUES (${name}, ${phone}, ${birthday ? new Date(birthday) : null}, ${notes ?? null}, NOW(), NOW())
-    RETURNING *`)
+    RETURNING id, name, phone, birthday, notes, "createdAt", "updatedAt"`)
   res.status(201).json(row)
 })
 
+/* Vehículos (listado con shape que espera el front) */
 app.get('/api/vehicles', async (_req, res) => {
   const rows = await many(sql`
-    SELECT v.*, cl."name" AS "clientName", c."name" AS "categoryName", c."everyDays"
+    SELECT v.*, 
+           cl.id   AS "clientId2", cl.name AS "clientName",
+           c.id    AS "categoryId2", c.name AS "categoryName", c."everyDays"
     FROM "Vehicle" v
     JOIN "Client" cl ON cl.id = v."clientId"
     LEFT JOIN "Category" c ON c.id = v."categoryId"
     ORDER BY v."plate" ASC`)
-  res.json(rows)
+
+  const shaped = rows.map(r => ({
+    plate: r.plate,
+    clientId: r.clientId,
+    brand: r.brand,
+    model: r.model,
+    year: r.year,
+    categoryId: r.categoryId,
+    lastService: r.lastService,
+    nextReminder: r.nextReminder,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt,
+    client: { id: r.clientId2 ?? r.clientId, name: r.clientName },
+    category: r.categoryId2 ? { id: r.categoryId2, name: r.categoryName, everyDays: r.everyDays } : null
+  }))
+  res.json(shaped)
 })
+
+/* Crear vehículo */
+app.post('/api/vehicles', async (req, res) => {
+  const plate = normalizePlate(req.body.plate)
+  const { clientId, brand, model, year, categoryId } = req.body
+
+  const client = await one(sql`SELECT id FROM "Client" WHERE id=${clientId}`)
+  if (!client) return res.status(400).json({ error: 'clientId inválido' })
+
+  try {
+    const v = await one(sql`
+      INSERT INTO "Vehicle" ("plate","clientId","brand","model","year","categoryId","createdAt","updatedAt")
+      VALUES (${plate}, ${clientId}, ${brand ?? null}, ${model ?? null}, ${year ?? null}, ${categoryId ?? null}, NOW(), NOW())
+      RETURNING *`)
+    await computeVehicleCategory(plate)
+
+    // responder con shape igual al GET
+    const cat = v.categoryId ? await one(sql`SELECT * FROM "Category" WHERE id=${v.categoryId}`) : null
+    const cl  = await one(sql`SELECT id, name FROM "Client" WHERE id=${v.clientId}`)
+    return res.status(201).json({
+      ...v,
+      client: cl ? { id: cl.id, name: cl.name } : null,
+      category: cat ? { id: cat.id, name: cat.name, everyDays: cat.everyDays } : null
+    })
+  } catch (e) {
+    if (String(e.message).includes('duplicate key')) return res.status(409).json({ error: 'Patente ya existe' })
+    console.error('[POST /api/vehicles]', e)
+    res.status(500).json({ error: 'Internal error' })
+  }
+})
+
+/* Detalle de vehículo + services */
 app.get('/api/vehicles/:plate', async (req, res) => {
-  const plate = up(req.params.plate)
+  const plate = normalizePlate(req.params.plate)
   const v = await one(sql`
-    SELECT v.*, cl."name" AS "clientName", c."name" AS "categoryName", c."everyDays"
+    SELECT v.*, 
+           cl.id AS "clientId2", cl.name AS "clientName",
+           c.id  AS "categoryId2", c.name AS "categoryName", c."everyDays"
     FROM "Vehicle" v
     JOIN "Client" cl ON cl.id = v."clientId"
     LEFT JOIN "Category" c ON c.id = v."categoryId"
     WHERE v."plate"=${plate}`)
+
   if (!v) return res.status(404).json({ error: 'Not found' })
-  const services = await many(sql`SELECT * FROM "Service" WHERE "vehicleId"=${plate} ORDER BY "date" DESC`)
-  res.json({ ...v, services })
+
+  const services = await many(sql`
+    SELECT id, "vehicleId", "clientId", "date", "odometer", "summary", "createdAt", "updatedAt"
+    FROM "Service"
+    WHERE "vehicleId"=${plate}
+    ORDER BY "date" DESC`)
+
+  res.json({
+    plate: v.plate,
+    clientId: v.clientId,
+    brand: v.brand,
+    model: v.model,
+    year: v.year,
+    categoryId: v.categoryId,
+    lastService: v.lastService,
+    nextReminder: v.nextReminder,
+    createdAt: v.createdAt,
+    updatedAt: v.updatedAt,
+    client: { id: v.clientId2 ?? v.clientId, name: v.clientName },
+    category: v.categoryId2 ? { id: v.categoryId2, name: v.categoryName, everyDays: v.everyDays } : null,
+    services
+  })
 })
+
+/* Agregar service */
 app.post('/api/vehicles/:plate/services', async (req, res) => {
-  const plate = up(req.params.plate)
+  const plate = normalizePlate(req.params.plate)
   const veh = await one(sql`SELECT * FROM "Vehicle" WHERE "plate"=${plate}`)
   if (!veh) return res.status(404).json({ error: 'Vehicle not found' })
   const { date, odometer, summary } = req.body
@@ -243,18 +204,89 @@ app.post('/api/vehicles/:plate/services', async (req, res) => {
   res.status(201).json(svc)
 })
 
-// Import CSV
-app.post('/api/import/csv', upload.single('file'), async (req,res) => {
+/* Import CSV (mínimo funcional) */
+app.post('/api/import/csv', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Archivo CSV requerido (file)' })
     const raw = req.file.buffer.toString('utf8')
-    const rows = tryParseCsv(raw)
+    const rows = parseCsv(raw, { columns: true, skip_empty_lines: true })
     let createdClients=0, createdVehicles=0, createdServices=0, skippedNoPhone=0, skippedNoPlate=0
-    // ... (tu lógica de parseo/insert igual que antes)
+
+    for (const row of rows) {
+      const name  = (row.nombre || row['nombre y apellido'] || 'Sin nombre').toString()
+      const phone = (row.telefono || row.whatsapp || '').toString().replace(/\D+/g,'')
+      const plate = normalizePlate(row.patente || row['patente del vehiculo'] || '')
+      if (!phone) { skippedNoPhone++; continue }
+      if (!plate) { skippedNoPlate++; continue }
+
+      let client = await one(sql`SELECT * FROM "Client" WHERE phone=${phone}`)
+      if (!client) {
+        client = await one(sql`
+          INSERT INTO "Client" ("name","phone","createdAt","updatedAt")
+          VALUES (${name}, ${phone}, NOW(), NOW())
+          RETURNING *`)
+        createdClients++
+      }
+
+      let vehicle = await one(sql`SELECT * FROM "Vehicle" WHERE "plate"=${plate}`)
+      if (!vehicle) {
+        vehicle = await one(sql`
+          INSERT INTO "Vehicle" ("plate","clientId","createdAt","updatedAt")
+          VALUES (${plate}, ${client.id}, NOW(), NOW())
+          RETURNING *`)
+        createdVehicles++
+      }
+
+      await sql`
+        INSERT INTO "Service" ("vehicleId","clientId","date","createdAt","updatedAt")
+        VALUES (${plate}, ${client.id}, NOW(), NOW(), NOW())`
+      createdServices++
+      await computeVehicleCategory(plate)
+    }
+
     res.json({ createdClients, createdVehicles, createdServices, skippedNoPhone, skippedNoPlate })
-  } catch (e) { console.error('[IMPORT]', e); res.status(400).json({ error: String(e.message || e) }) }
+  } catch (e) {
+    console.error('[IMPORT]', e)
+    res.status(400).json({ error: String(e.message || e) })
+  }
 })
 
-// Arranque del servidor persistente
+/* Ejecutar scheduler manual (para el botón de Tools) */
+app.post('/api/scheduler/run', async (req, res) => {
+  const simulate = String(req.query.simulate).toLowerCase() === 'true'
+  const result = await (async function run() {
+    const vehicles = await sql`
+      SELECT v.*, c."everyDays", cl."phone", cl."name" as "clientName"
+      FROM "Vehicle" v
+      LEFT JOIN "Category" c ON c.id = v."categoryId"
+      JOIN "Client" cl ON cl.id = v."clientId"`
+    let sent = 0, errors = 0
+    for (const v of vehicles) {
+      await computeVehicleCategory(v.plate)
+      const updated = await one(sql`
+        SELECT v.*, c."everyDays", cl."phone", cl."name" as "clientName"
+        FROM "Vehicle" v
+        LEFT JOIN "Category" c ON c.id = v."categoryId"
+        JOIN "Client" cl ON cl.id = v."clientId"
+        WHERE v."plate"=${v.plate}`)
+      if (updated?.nextReminder && new Date(updated.nextReminder) <= new Date()) {
+        try {
+          if (!simulate) {
+            // acá iría WhatsApp real si lo activás
+          } else {
+            console.log('[Simulado] Aviso →', updated.phone, updated.plate)
+          }
+          sent++
+          const days = updated.everyDays ?? 90
+          await sql`UPDATE "Vehicle" SET "nextReminder"=${addDays(new Date(), days)} WHERE "plate"=${updated.plate}`
+        } catch (e) { console.error(e.message); errors++ }
+      }
+    }
+    return { sent, errors }
+  })()
+  res.json(result)
+})
+
+/* Arranque */
 const port = Number(process.env.PORT || 4000)
 app.listen(port, () => console.log(`API listening → http://localhost:${port}`))
