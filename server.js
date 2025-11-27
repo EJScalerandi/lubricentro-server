@@ -1,4 +1,4 @@
-// server.js
+// server.cjs
 require('dotenv').config()
 
 const express = require('express')
@@ -18,11 +18,23 @@ const sql = postgres(process.env.DATABASE_URL, {
   max_lifetime: 60 * 30
 })
 
-// Helpers para consultas
 const many = async (q) => q
 const one = async (q) => {
   const rows = await q
   return rows[0] || null
+}
+
+// ------------------------
+// Helpers
+// ------------------------
+function normalizePlate(plate) {
+  if (!plate) return null
+  return String(plate).toUpperCase().replace(/\s+/g, '')
+}
+
+// Stub: reemplazá por tu lógica real si ya la tenías
+async function computeVehicleCategory(_plate) {
+  return
 }
 
 // ------------------------
@@ -32,40 +44,19 @@ app.use(cors())
 app.use(bodyParser.json())
 
 // ------------------------
-// Helpers de dominio
-// ------------------------
-function normalizePlate(plate) {
-  if (!plate) return null
-  return String(plate).toUpperCase().replace(/\s+/g, '')
-}
-
-// Este helper lo dejo como stub, en tu proyecto probablemente
-// ya tengas una implementación más completa.
-// Si es así, conservá TU versión original.
-async function computeVehicleCategory(plate) {
-  // Ejemplo simple (puedes reemplazar por tu lógica original)
-  // Aquí podrías:
-  // - Buscar último service del vehículo
-  // - Mirar categoría y everyDays
-  // - Calcular nextReminder y actualizar Vehicle
-  return
-}
-
-// ------------------------
-// Endpoints básicos
+// Health
 // ------------------------
 app.get('/health', (_req, res) => {
   res.json({ ok: true })
 })
 
-/**
- * CLIENTES
- * (Ejemplo muy simple, adaptá a tu server real si ya lo tenés)
- */
+// ------------------------
+// CLIENTES
+// ------------------------
 app.get('/api/clients', async (_req, res) => {
   try {
     const rows = await many(sql`
-      SELECT id, name, phone, email, createdAt, updatedAt
+      SELECT id, name, phone, email, "createdAt", "updatedAt"
       FROM "Client"
       ORDER BY "name" ASC`)
     res.json(rows)
@@ -75,13 +66,13 @@ app.get('/api/clients', async (_req, res) => {
   }
 })
 
-/**
- * CATEGORÍAS
- */
+// ------------------------
+// CATEGORÍAS
+// ------------------------
 app.get('/api/categories', async (_req, res) => {
   try {
     const rows = await many(sql`
-      SELECT id, name, "everyDays", createdAt, updatedAt
+      SELECT id, name, "everyDays", "createdAt", "updatedAt"
       FROM "Category"
       ORDER BY "name" ASC`)
     res.json(rows)
@@ -95,16 +86,17 @@ app.get('/api/categories', async (_req, res) => {
 // VEHÍCULOS
 // --------------------------------------------------
 
-/**
- * GET /api/vehicles
- * Ahora permite vehículos SIN cliente (LEFT JOIN)
- */
+// GET /api/vehicles – ahora incluye info de cliente (incl. phone) y permite sin cliente
 app.get('/api/vehicles', async (_req, res) => {
   try {
     const rows = await many(sql`
       SELECT v.*, 
-             cl.id   AS "clientId2", cl.name AS "clientName",
-             c.id    AS "categoryId2", c.name AS "categoryName", c."everyDays"
+             cl.id    AS "clientId2",
+             cl.name  AS "clientName",
+             cl.phone AS "clientPhone",
+             c.id     AS "categoryId2",
+             c.name   AS "categoryName",
+             c."everyDays"
       FROM "Vehicle" v
       LEFT JOIN "Client"   cl ON cl.id = v."clientId"
       LEFT JOIN "Category" c  ON c.id = v."categoryId"
@@ -122,7 +114,7 @@ app.get('/api/vehicles', async (_req, res) => {
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
       client: r.clientId2
-        ? { id: r.clientId2, name: r.clientName }
+        ? { id: r.clientId2, name: r.clientName, phone: r.clientPhone }
         : null,
       category: r.categoryId2
         ? { id: r.categoryId2, name: r.categoryName, everyDays: r.everyDays }
@@ -136,10 +128,7 @@ app.get('/api/vehicles', async (_req, res) => {
   }
 })
 
-/**
- * GET /api/vehicles/:plate
- * También permite vehículo sin cliente (LEFT JOIN)
- */
+// GET /api/vehicles/:plate – detalle (también permite sin cliente)
 app.get('/api/vehicles/:plate', async (req, res) => {
   try {
     const plate = normalizePlate(req.params.plate)
@@ -147,8 +136,12 @@ app.get('/api/vehicles/:plate', async (req, res) => {
 
     const v = await one(sql`
       SELECT v.*, 
-             cl.id AS "clientId2", cl.name AS "clientName",
-             c.id  AS "categoryId2", c.name AS "categoryName", c."everyDays"
+             cl.id    AS "clientId2",
+             cl.name  AS "clientName",
+             cl.phone AS "clientPhone",
+             c.id     AS "categoryId2",
+             c.name   AS "categoryName",
+             c."everyDays"
       FROM "Vehicle" v
       LEFT JOIN "Client"   cl ON cl.id = v."clientId"
       LEFT JOIN "Category" c  ON c.id = v."categoryId"
@@ -174,7 +167,7 @@ app.get('/api/vehicles/:plate', async (req, res) => {
       createdAt: v.createdAt,
       updatedAt: v.updatedAt,
       client: v.clientId2
-        ? { id: v.clientId2, name: v.clientName }
+        ? { id: v.clientId2, name: v.clientName, phone: v.clientPhone }
         : null,
       category: v.categoryId2
         ? { id: v.categoryId2, name: v.categoryName, everyDays: v.everyDays }
@@ -187,28 +180,22 @@ app.get('/api/vehicles/:plate', async (req, res) => {
   }
 })
 
-/**
- * POST /api/vehicles
- * Ahora clientId es OPCIONAL.
- * - Si viene vacío / null → se guarda null.
- * - Si viene con valor → se valida que exista el cliente.
- */
+// POST /api/vehicles – clientId opcional
 app.post('/api/vehicles', async (req, res) => {
   try {
     const plate = normalizePlate(req.body.plate)
-    let { clientId, brand, model, year, categoryId } = req.body
+    const { brand, model, year, categoryId } = req.body
+    let { clientId } = req.body
 
     if (!plate) {
       return res.status(400).json({ error: 'Patente requerida' })
     }
 
-    // Normalizar clientId a número o null
     const clientIdNormalized =
       clientId === undefined || clientId === null || clientId === ''
         ? null
         : Number(clientId)
 
-    // Validar cliente solo si viene algo
     if (clientIdNormalized !== null) {
       const client = await one(sql`SELECT id FROM "Client" WHERE id = ${clientIdNormalized}`)
       if (!client) {
@@ -231,14 +218,16 @@ app.post('/api/vehicles', async (req, res) => {
       )
       RETURNING *`)
 
-    // Recalcular info de categoría / recordatorios si aplica
     await computeVehicleCategory(plate)
 
-    // Traer cliente y categoría para responder con el mismo formato que el GET
     const row = await one(sql`
       SELECT v.*,
-             cl.id AS "clientId2", cl.name AS "clientName",
-             c.id  AS "categoryId2", c.name AS "categoryName", c."everyDays"
+             cl.id    AS "clientId2",
+             cl.name  AS "clientName",
+             cl.phone AS "clientPhone",
+             c.id     AS "categoryId2",
+             c.name   AS "categoryName",
+             c."everyDays"
       FROM "Vehicle" v
       LEFT JOIN "Client"   cl ON cl.id = v."clientId"
       LEFT JOIN "Category" c  ON c.id = v."categoryId"
@@ -256,7 +245,7 @@ app.post('/api/vehicles', async (req, res) => {
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
       client: row.clientId2
-        ? { id: row.clientId2, name: row.clientName }
+        ? { id: row.clientId2, name: row.clientName, phone: row.clientPhone }
         : null,
       category: row.categoryId2
         ? { id: row.categoryId2, name: row.categoryName, everyDays: row.everyDays }
@@ -267,17 +256,15 @@ app.post('/api/vehicles', async (req, res) => {
   } catch (err) {
     console.error(err)
     if (err && err.code === '23505') {
-      // unique_violation (patente duplicada)
       return res.status(400).json({ error: 'Ya existe un vehículo con esa patente' })
     }
     res.status(500).json({ error: 'Error al crear vehículo' })
   }
 })
 
-/**
- * Servicios (ejemplo muy simple)
- * En tu proyecto probablemente esto ya esté más completo.
- */
+// ------------------------
+// SERVICES (ejemplo simple)
+// ------------------------
 app.post('/api/services', async (req, res) => {
   try {
     const { vehicleId, clientId, date, odometer, summary } = req.body
@@ -299,7 +286,6 @@ app.post('/api/services', async (req, res) => {
       )
       RETURNING *`)
 
-    // Podés querer recomputar recordatorios al cargar un service
     await computeVehicleCategory(vehicleId)
 
     res.status(201).json(service)
@@ -309,8 +295,121 @@ app.post('/api/services', async (req, res) => {
   }
 })
 
+// --------------------------------------------------
+// MESSAGE TEMPLATE (PLANTILLAS DE MENSAJE)
+// Tabla: "MessageTemplate"
+// --------------------------------------------------
+
+// GET lista
+app.get('/api/message-templates', async (_req, res) => {
+  try {
+    const rows = await many(sql`
+      SELECT id, name, body, "createdAt", "updatedAt"
+      FROM "MessageTemplate"
+      ORDER BY id ASC`)
+    res.json(rows)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Error al obtener plantillas de mensajes' })
+  }
+})
+
+// GET una
+app.get('/api/message-templates/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'id inválido' })
+
+    const tpl = await one(sql`
+      SELECT id, name, body, "createdAt", "updatedAt"
+      FROM "MessageTemplate"
+      WHERE id = ${id}`)
+
+    if (!tpl) return res.status(404).json({ error: 'No encontrada' })
+
+    res.json(tpl)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Error al obtener plantilla' })
+  }
+})
+
+// POST crear
+app.post('/api/message-templates', async (req, res) => {
+  try {
+    const { name, body } = req.body
+    if (!name || !body) {
+      return res.status(400).json({ error: 'name y body son requeridos' })
+    }
+
+    const tpl = await one(sql`
+      INSERT INTO "MessageTemplate"
+        ("name", "body", "createdAt", "updatedAt")
+      VALUES (
+        ${name},
+        ${body},
+        NOW(),
+        NOW()
+      )
+      RETURNING id, name, body, "createdAt", "updatedAt"`)
+
+    res.status(201).json(tpl)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Error al crear plantilla' })
+  }
+})
+
+// PUT actualizar
+app.put('/api/message-templates/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'id inválido' })
+
+    const { name, body } = req.body
+    if (!name || !body) {
+      return res.status(400).json({ error: 'name y body son requeridos' })
+    }
+
+    const tpl = await one(sql`
+      UPDATE "MessageTemplate"
+      SET "name" = ${name},
+          "body" = ${body},
+          "updatedAt" = NOW()
+      WHERE id = ${id}
+      RETURNING id, name, body, "createdAt", "updatedAt"`)
+
+    if (!tpl) return res.status(404).json({ error: 'No encontrada' })
+
+    res.json(tpl)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Error al actualizar plantilla' })
+  }
+})
+
+// DELETE eliminar
+app.delete('/api/message-templates/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'id inválido' })
+
+    const tpl = await one(sql`
+      DELETE FROM "MessageTemplate"
+      WHERE id = ${id}
+      RETURNING id`)
+
+    if (!tpl) return res.status(404).json({ error: 'No encontrada' })
+
+    res.json({ ok: true })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Error al eliminar plantilla' })
+  }
+})
+
 // ------------------------
-// Arranque del servidor
+// Arranque del server
 // ------------------------
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`)
