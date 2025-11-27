@@ -1,4 +1,4 @@
-// server.cjs
+// server.js (o server.cjs)
 require('dotenv').config()
 
 const express = require('express')
@@ -53,6 +53,8 @@ app.get('/health', (_req, res) => {
 // ------------------------
 // CLIENTES
 // ------------------------
+
+// GET lista
 app.get('/api/clients', async (_req, res) => {
   try {
     const rows = await many(sql`
@@ -63,6 +65,76 @@ app.get('/api/clients', async (_req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Error al obtener clientes' })
+  }
+})
+
+// POST crear cliente
+app.post('/api/clients', async (req, res) => {
+  try {
+    let { name, phone, email } = req.body
+
+    name = name ? String(name).trim() : null
+    phone = phone ? String(phone).trim() : null
+    email = email ? String(email).trim() : null
+
+    if (!name && !phone && !email) {
+      return res.status(400).json({ error: 'Cargá al menos nombre, teléfono o email' })
+    }
+
+    const client = await one(sql`
+      INSERT INTO "Client"
+        ("name", "phone", "email", "createdAt", "updatedAt")
+      VALUES (
+        ${name},
+        ${phone},
+        ${email},
+        NOW(),
+        NOW()
+      )
+      RETURNING id, name, phone, email, "createdAt", "updatedAt"`)
+
+    res.status(201).json(client)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Error al crear cliente' })
+  }
+})
+
+// PUT actualizar cliente
+app.put('/api/clients/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    if (Number.isNaN(id)) {
+      return res.status(400).json({ error: 'id inválido' })
+    }
+
+    let { name, phone, email } = req.body
+
+    name = name ? String(name).trim() : null
+    phone = phone ? String(phone).trim() : null
+    email = email ? String(email).trim() : null
+
+    if (!name && !phone && !email) {
+      return res.status(400).json({ error: 'Cargá al menos nombre, teléfono o email' })
+    }
+
+    const client = await one(sql`
+      UPDATE "Client"
+      SET "name"      = ${name},
+          "phone"     = ${phone},
+          "email"     = ${email},
+          "updatedAt" = NOW()
+      WHERE id = ${id}
+      RETURNING id, name, phone, email, "createdAt", "updatedAt"`)
+
+    if (!client) {
+      return res.status(404).json({ error: 'Cliente no encontrado' })
+    }
+
+    res.json(client)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Error al actualizar cliente' })
   }
 })
 
@@ -86,7 +158,7 @@ app.get('/api/categories', async (_req, res) => {
 // VEHÍCULOS
 // --------------------------------------------------
 
-// GET /api/vehicles – ahora incluye info de cliente (incl. phone) y permite sin cliente
+// GET /api/vehicles – incluye info de cliente (incl. phone) y categoría
 app.get('/api/vehicles', async (_req, res) => {
   try {
     const rows = await many(sql`
@@ -128,7 +200,7 @@ app.get('/api/vehicles', async (_req, res) => {
   }
 })
 
-// GET /api/vehicles/:plate – detalle (también permite sin cliente)
+// GET /api/vehicles/:plate – detalle
 app.get('/api/vehicles/:plate', async (req, res) => {
   try {
     const plate = normalizePlate(req.params.plate)
@@ -150,7 +222,10 @@ app.get('/api/vehicles/:plate', async (req, res) => {
     if (!v) return res.status(404).json({ error: 'Not found' })
 
     const services = await many(sql`
-      SELECT id, "vehicleId", "clientId", "date", "odometer", "summary", "createdAt", "updatedAt"
+      SELECT id, "vehicleId", "clientId", "date", "odometer", "summary",
+             "oil", "filterOil", "filterAir", "filterFuel", "filterCabin",
+             "otherServices", "totalPrice",
+             "createdAt", "updatedAt"
       FROM "Service"
       WHERE "vehicleId" = ${plate}
       ORDER BY "date" DESC`)
@@ -262,25 +337,87 @@ app.post('/api/vehicles', async (req, res) => {
   }
 })
 
+// PUT /api/vehicles/:plate – asignar/quitar cliente (y solo eso por ahora)
+app.put('/api/vehicles/:plate', async (req, res) => {
+  try {
+    const plate = normalizePlate(req.params.plate)
+    if (!plate) return res.status(400).json({ error: 'Patente inválida' })
+
+    const { clientId } = req.body
+
+    const clientIdNormalized =
+      clientId === undefined || clientId === null || clientId === ''
+        ? null
+        : Number(clientId)
+
+    if (clientIdNormalized !== null) {
+      const cli = await one(sql`SELECT id FROM "Client" WHERE id = ${clientIdNormalized}`)
+      if (!cli) {
+        return res.status(400).json({ error: 'clientId inválido' })
+      }
+    }
+
+    const vehicle = await one(sql`
+      UPDATE "Vehicle"
+      SET "clientId"  = ${clientIdNormalized},
+          "updatedAt" = NOW()
+      WHERE "plate" = ${plate}
+      RETURNING *`)
+
+    if (!vehicle) {
+      return res.status(404).json({ error: 'Vehículo no encontrado' })
+    }
+
+    res.json(vehicle)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Error al actualizar vehículo' })
+  }
+})
+
 // ------------------------
-// SERVICES (ejemplo simple)
+// SERVICES
 // ------------------------
 app.post('/api/services', async (req, res) => {
   try {
-    const { vehicleId, clientId, date, odometer, summary } = req.body
+    const {
+      vehicleId,
+      clientId,
+      date,
+      odometer,
+      summary,
+      oil,
+      filterOil,
+      filterAir,
+      filterFuel,
+      filterCabin,
+      otherServices,
+      totalPrice
+    } = req.body
+
     if (!vehicleId || !date) {
       return res.status(400).json({ error: 'vehicleId y date son obligatorios' })
     }
 
     const service = await one(sql`
       INSERT INTO "Service"
-        ("vehicleId", "clientId", "date", "odometer", "summary", "createdAt", "updatedAt")
+        ("vehicleId", "clientId", "date", "odometer", "summary",
+         "oil", "filterOil", "filterAir", "filterFuel", "filterCabin",
+         "otherServices", "totalPrice",
+         "createdAt", "updatedAt")
       VALUES (
         ${vehicleId},
         ${clientId ?? null},
         ${date},
         ${odometer ?? null},
         ${summary ?? null},
+        ${oil ?? null},
+        ${filterOil ?? null},
+        ${filterAir ?? null},
+        ${filterFuel ?? null},
+        ${filterCabin ?? null},
+        ${otherServices ?? null},
+        ${totalPrice ?? null},
         NOW(),
         NOW()
       )
@@ -297,10 +434,8 @@ app.post('/api/services', async (req, res) => {
 
 // --------------------------------------------------
 // MESSAGE TEMPLATE (PLANTILLAS DE MENSAJE)
-// Tabla: "MessageTemplate"
 // --------------------------------------------------
 
-// GET lista
 app.get('/api/message-templates', async (_req, res) => {
   try {
     const rows = await many(sql`
@@ -314,7 +449,6 @@ app.get('/api/message-templates', async (_req, res) => {
   }
 })
 
-// GET una
 app.get('/api/message-templates/:id', async (req, res) => {
   try {
     const id = Number(req.params.id)
@@ -334,7 +468,6 @@ app.get('/api/message-templates/:id', async (req, res) => {
   }
 })
 
-// POST crear
 app.post('/api/message-templates', async (req, res) => {
   try {
     const { name, body } = req.body
@@ -360,7 +493,6 @@ app.post('/api/message-templates', async (req, res) => {
   }
 })
 
-// PUT actualizar
 app.put('/api/message-templates/:id', async (req, res) => {
   try {
     const id = Number(req.params.id)
@@ -388,7 +520,6 @@ app.put('/api/message-templates/:id', async (req, res) => {
   }
 })
 
-// DELETE eliminar
 app.delete('/api/message-templates/:id', async (req, res) => {
   try {
     const id = Number(req.params.id)

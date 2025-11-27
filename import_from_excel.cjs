@@ -6,13 +6,13 @@ const postgres = require('postgres')
 const xlsx = require('xlsx')
 
 // ------------------------
-// Conexión a Neon (igual que en server.js, pero sin prepared statements)
+// Conexión a Neon
 // ------------------------
 const sql = postgres(process.env.DATABASE_URL, {
   ssl: process.env.DATABASE_SSL === 'true' ? 'require' : undefined,
   idle_timeout: 20,
   max_lifetime: 60 * 30,
-  prepare: false // <- clave para evitar "cached plan must not change result type"
+  prepare: false // <- importante para evitar "cached plan must not change result type"
 })
 
 const many = async (q) => q
@@ -41,17 +41,48 @@ function extractBrandModelYear(value) {
   const brand = parts[0] || null
   const model = parts.slice(1).join(' ') || null
 
-  // Busca año tipo 1990–2049
+  // Busca año tipo 1950–2049
   const matchYear = str.match(/(19[5-9]\d|20[0-4]\d)/)
   const year = matchYear ? Number(matchYear[0]) : null
 
   return { brand, model, year }
 }
 
+// ✅ Versión robusta: Date, número de Excel o string dd/mm/yyyy
 function toDateOnly(value) {
   if (!value) return null
-  const d = value instanceof Date ? value : new Date(value)
+
+  let d
+
+  // 1) Ya es Date
+  if (value instanceof Date) {
+    d = value
+  } else if (typeof value === 'number') {
+    // 2) Número "serial" de Excel (días desde 1899-12-30)
+    const excelEpoch = Date.UTC(1899, 11, 30) // 1899-12-30
+    const ms = excelEpoch + value * 24 * 60 * 60 * 1000
+    d = new Date(ms)
+  } else if (typeof value === 'string') {
+    const str = value.trim()
+    if (!str) return null
+
+    // 3) Formato dd/mm/yyyy (25/10/2024)
+    const m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/)
+    if (m) {
+      const day = Number(m[1])
+      const month = Number(m[2]) - 1
+      const year = Number(m[3])
+      d = new Date(year, month, day)
+    } else {
+      // 4) Último intento: que JS lo entienda solo
+      d = new Date(str)
+    }
+  } else {
+    d = new Date(value)
+  }
+
   if (isNaN(d.getTime())) return null
+
   const yyyy = d.getFullYear()
   const mm = String(d.getMonth() + 1).padStart(2, '0')
   const dd = String(d.getDate()).padStart(2, '0')
@@ -105,7 +136,6 @@ async function upsertClient(nameRaw, phoneRaw, emailRaw) {
   }
 
   if (client) {
-    // si falta phone o email, los completamos
     const newPhone = client.phone || phone
     const newEmail = client.email || email
 
@@ -193,6 +223,7 @@ async function upsertVehicle(plate, brandModelYear, client) {
 // Insert de Service
 // ------------------------
 async function insertService(plate, client, row) {
+  // 👉 Regla: primero "Fecha"; si está vacía, "Marca temporal"
   const date =
     toDateOnly(row['Fecha']) ||
     toDateOnly(row['Marca temporal']) ||
@@ -256,7 +287,11 @@ async function main() {
   const sheetName = workbook.SheetNames[0]
   const sheet = workbook.Sheets[sheetName]
 
-  const rows = xlsx.utils.sheet_to_json(sheet, { defval: '' })
+  const rows = xlsx.utils.sheet_to_json(sheet, {
+    defval: '',
+    cellDates: true, // 👉 devuelve Date cuando la celda es fecha
+    raw: false       // 👉 intenta parsear los valores (incluye fechas)
+  })
   console.log(`Filas leídas: ${rows.length}`)
 
   let imported = 0
