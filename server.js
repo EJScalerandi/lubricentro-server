@@ -378,6 +378,68 @@ app.put('/api/vehicles/:plate', async (req, res) => {
 // ------------------------
 // SERVICES
 // ------------------------
+app.get('/api/services', async (_req, res) => {
+  try {
+    const rows = await many(sql`
+      SELECT
+        s.id,
+        s."vehicleId",
+        s."clientId",
+        s."date",
+        s."odometer",
+        s."summary",
+        s."oil",
+        s."filterOil",
+        s."filterAir",
+        s."filterFuel",
+        s."filterCabin",
+        s."otherServices",
+        s."totalPrice",
+        s."createdAt",
+        s."updatedAt",
+        v."brand" AS "vehicleBrand",
+        v."model" AS "vehicleModel",
+        c."name"  AS "clientName",
+        c."phone" AS "clientPhone"
+      FROM "Service" s
+      LEFT JOIN "Vehicle" v ON v."plate" = s."vehicleId"
+      LEFT JOIN "Client"  c ON c."id"   = s."clientId"
+      ORDER BY s."date" DESC, s.id DESC
+    `)
+
+    const shaped = rows.map((r) => ({
+      id: r.id,
+      vehicleId: r.vehicleId,
+      clientId: r.clientId,
+      date: r.date,
+      odometer: r.odometer,
+      summary: r.summary,
+      oil: r.oil,
+      filterOil: r.filterOil,
+      filterAir: r.filterAir,
+      filterFuel: r.filterFuel,
+      filterCabin: r.filterCabin,
+      otherServices: r.otherServices,
+      totalPrice: r.totalPrice,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+      vehicle: {
+        brand: r.vehicleBrand,
+        model: r.vehicleModel
+      },
+      client: r.clientId
+        ? { id: r.clientId, name: r.clientName, phone: r.clientPhone }
+        : null
+    }))
+
+    res.json(shaped)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Error al obtener services' })
+  }
+})
+
+
 app.post('/api/services', async (req, res) => {
   try {
     const {
