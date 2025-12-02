@@ -37,7 +37,9 @@ function normalizePlate(plate) {
 
 // Recalcula lastService y nextReminder para un vehículo
 async function computeVehicleCategory(plate) {
-  if (!plate) return
+  const normalized = normalizePlate(plate)
+  if (!normalized) return
+
   try {
     await one(sql`
       UPDATE "Vehicle" v
@@ -45,17 +47,17 @@ async function computeVehicleCategory(plate) {
         "lastService" = sub.last_service,
         "nextReminder" = CASE
           WHEN sub.last_service IS NOT NULL AND c."everyDays" IS NOT NULL
-            THEN sub.last_service + (c."everyDays" || ' days')::interval
+            THEN sub.last_service + (c."everyDays" * INTERVAL '1 day')
           ELSE NULL
         END,
         "updatedAt" = NOW()
       FROM (
         SELECT MAX(s."date") AS last_service
         FROM "Service" s
-        WHERE s."vehicleId" = ${plate}
+        WHERE s."vehicleId" = ${normalized}
       ) sub
       LEFT JOIN "Category" c ON c.id = v."categoryId"
-      WHERE v."plate" = ${plate}
+      WHERE v."plate" = ${normalized}
       RETURNING v."plate"
     `)
   } catch (err) {
@@ -70,13 +72,12 @@ app.use(cors())
 app.use(bodyParser.json())
 
 // Middleware simple de autenticación con JWT
-// (de momento SOLO se usa si el front manda Authorization: Bearer xxx,
-// no bloqueamos las rutas viejas para no romper nada)
+// (de momento SOLO se usa si el front manda Authorization: Bearer xxx)
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || ''
   const [type, token] = auth.split(' ')
   if (!token || type !== 'Bearer') {
-    // si no hay token, simplemente seguimos (el front se encarga de no mostrar las pantallas protegidas)
+    // si no hay token, simplemente seguimos
     return next()
   }
 
@@ -186,7 +187,7 @@ app.get('/api/vehicles', async (_req, res) => {
       model: r.model,
       year: r.year,
       categoryId: r.categoryId,
-      lastService: r.lastService,      // ya viene calculado por computeVehicleCategory
+      lastService: r.lastService,
       nextReminder: r.nextReminder,
       contactName: r.contactName,
       contactPhone: r.contactPhone,
@@ -437,6 +438,8 @@ app.post('/api/services', async (req, res) => {
       return res.status(400).json({ error: 'vehicleId y date son obligatorios' })
     }
 
+    const normalizedVehicleId = normalizePlate(vehicleId)
+
     const service = await one(sql`
       INSERT INTO "Service"
         ("vehicleId", "date", "odometer", "summary",
@@ -444,7 +447,7 @@ app.post('/api/services', async (req, res) => {
          "otherServices", "totalPrice",
          "createdAt", "updatedAt")
       VALUES (
-        ${vehicleId},
+        ${normalizedVehicleId},
         ${date},
         ${odometer ?? null},
         ${summary ?? null},
@@ -461,7 +464,7 @@ app.post('/api/services', async (req, res) => {
       RETURNING *`)
 
     // recalcular lastService/nextReminder del vehículo
-    await computeVehicleCategory(vehicleId)
+    await computeVehicleCategory(normalizedVehicleId)
 
     res.status(201).json(service)
   } catch (err) {
