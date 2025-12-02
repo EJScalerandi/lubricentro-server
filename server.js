@@ -660,6 +660,7 @@ app.post('/api/vehicles', async (req, res) => {
   }
 })
 
+
 // PUT /api/vehicles/:plate
 app.put('/api/vehicles/:plate', async (req, res) => {
   try {
@@ -672,7 +673,8 @@ app.put('/api/vehicles/:plate', async (req, res) => {
       year,
       categoryId,
       contactName,
-      contactPhone
+      contactPhone,
+      nextReminder // <-- NUEVO
     } = req.body
 
     const vehicle = await one(sql`
@@ -683,6 +685,7 @@ app.put('/api/vehicles/:plate', async (req, res) => {
           "categoryId"   = ${categoryId ?? null},
           "contactName"  = ${contactName ?? null},
           "contactPhone" = ${contactPhone ?? null},
+          "nextReminder" = ${nextReminder ?? null}, -- <-- NUEVO
           "updatedAt"    = NOW()
       WHERE "plate" = ${plate}
       RETURNING *`)
