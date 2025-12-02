@@ -4,16 +4,19 @@
   "private": true,
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "import:excel": "node import_from_excel.cjs"
   },
   "engines": {
     "node": "20.x"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "csv-parse": "^5.5.6",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
     "multer": "^1.4.5-lts.2",
     "node-cron": "^3.0.3",
     "postgres": "^3.4.7",
