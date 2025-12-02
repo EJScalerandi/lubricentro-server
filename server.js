@@ -82,9 +82,25 @@ function diffInDays(a, b) {
   return Math.round((aUTC - bUTC) / msPerDay)
 }
 
+function parseDate(value) {
+  if (!value) return null
+  if (value instanceof Date) return value
+  // Asumimos string "YYYY-MM-DD" o similar
+  const s = String(value).slice(0, 10) // YYYY-MM-DD
+  const [yStr, mStr, dStr] = s.split('-')
+  const y = Number(yStr)
+  const m = Number(mStr)
+  const d = Number(dStr)
+  if (!y || !m || !d) return null
+  // Usamos UTC para evitar quilombos de timezone
+  return new Date(Date.UTC(y, m - 1, d))
+}
+
 function addDays(baseDate, days) {
-  const d = new Date(baseDate)
-  d.setDate(d.getDate() + days)
+  const base = parseDate(baseDate)
+  if (!base) return null
+  const d = new Date(base.getTime())
+  d.setUTCDate(d.getUTCDate() + days)
   return d
 }
 
@@ -119,12 +135,12 @@ async function computeVehicleCategory(plate) {
     const seen = new Set()
 
     for (const row of services) {
-      const d = row.date
+      const d = parseDate(row.date)
       if (!d) continue
       const key = d.toISOString().slice(0, 10) // YYYY-MM-DD
       if (!seen.has(key)) {
         seen.add(key)
-        uniqueDates.push(new Date(d))
+        uniqueDates.push(d)
       }
     }
 
@@ -337,10 +353,10 @@ app.post('/api/users', async (req, res) => {
     }
 
     // ¿ya existe?
-    const existing = await one(sql`
+    theExisting = await one(sql`
       SELECT id FROM "users" WHERE username = ${username} LIMIT 1
     `)
-    if (existing) {
+    if (theExisting) {
       return res
         .status(400)
         .json({ error: 'Ya existe un usuario con ese username' })
