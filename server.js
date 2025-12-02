@@ -35,31 +35,29 @@ function normalizePlate(plate) {
   return String(plate).toUpperCase().replace(/\s+/g, '')
 }
 
-function cleanPhone(raw) {
-  if (raw === null || raw === undefined) return null
-  const s = String(raw).replace(/\s+/g, '').trim()
-  return s || null
-}
-
-// Recalcula lastService (y deja nextReminder en NULL por ahora)
+// Recalcula lastService y nextReminder para un vehículo
 async function computeVehicleCategory(plate) {
-  const normalized = normalizePlate(plate)
-  if (!normalized) return
-
+  if (!plate) return
   try {
-    await sql`
+    await one(sql`
       UPDATE "Vehicle" v
       SET
         "lastService" = sub.last_service,
-        "nextReminder" = NULL,
+        "nextReminder" = CASE
+          WHEN sub.last_service IS NOT NULL AND c."everyDays" IS NOT NULL
+            THEN sub.last_service + (c."everyDays" || ' days')::interval
+          ELSE NULL
+        END,
         "updatedAt" = NOW()
       FROM (
         SELECT MAX(s."date") AS last_service
         FROM "Service" s
-        WHERE s."vehicleId" = ${normalized}
+        WHERE s."vehicleId" = ${plate}
       ) sub
-      WHERE v."plate" = ${normalized}
-    `
+      LEFT JOIN "Category" c ON c.id = v."categoryId"
+      WHERE v."plate" = ${plate}
+      RETURNING v."plate"
+    `)
   } catch (err) {
     console.error('Error en computeVehicleCategory:', err.message)
   }
@@ -72,7 +70,7 @@ app.use(cors())
 app.use(bodyParser.json())
 
 // Middleware simple de autenticación con JWT
-function authMiddleware(req, res, next) {
+function authMiddleware(req, _res, next) {
   const auth = req.headers.authorization || ''
   const [type, token] = auth.split(' ')
   if (!token || type !== 'Bearer') {
@@ -81,10 +79,11 @@ function authMiddleware(req, res, next) {
 
   try {
     const payload = jwt.verify(token, JWT_SECRET)
+    // payload: { userId, username, isAdmin }
     req.user = payload
     return next()
-  } catch (err) {
-    return res.status(401).json({ error: 'Token inválido' })
+  } catch (_err) {
+    return next()
   }
 }
 
@@ -100,6 +99,7 @@ app.get('/health', (_req, res) => {
 // ------------------------
 // LOGIN
 // ------------------------
+// Tabla users: id, username, password_hash, name, is_admin, created_at, updated_at
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body
@@ -108,7 +108,7 @@ app.post('/api/login', async (req, res) => {
     }
 
     const user = await one(sql`
-      SELECT id, username, password_hash
+      SELECT id, username, password_hash, name, is_admin
       FROM "users"
       WHERE username = ${username}
       LIMIT 1`)
@@ -123,15 +123,124 @@ app.post('/api/login', async (req, res) => {
     }
 
     const token = jwt.sign(
-      { userId: user.id, username: user.username },
+      {
+        userId: user.id,
+        username: user.username,
+        isAdmin: !!user.is_admin
+      },
       JWT_SECRET,
       { expiresIn: '7d' }
     )
 
-    res.json({ token })
+    // Podés usar sólo token (como hasta ahora) o también estos datos en el front
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        name: user.name || null,
+        isAdmin: !!user.is_admin
+      }
+    })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Error al hacer login' })
+  }
+})
+
+// ------------------------
+// ADMIN: USUARIOS / EMPLEADOS
+// ------------------------
+
+// Lista de usuarios (empleados), solo para admin
+app.get('/api/users', async (req, res) => {
+  try {
+    if (!req.user || !req.user.isAdmin) {
+      return res.status(403).json({ error: 'Solo el admin puede ver usuarios' })
+    }
+
+    const currentId = req.user.userId
+
+    const rows = await many(sql`
+      SELECT
+        id,
+        username,
+        name,
+        is_admin AS "isAdmin",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM "users"
+      WHERE id <> ${currentId}
+      ORDER BY username ASC
+    `)
+
+    res.json(rows)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Error al obtener usuarios' })
+  }
+})
+
+// Cambiar password de un usuario (pide clave del admin)
+app.post('/api/users/change-password', async (req, res) => {
+  try {
+    if (!req.user || !req.user.isAdmin) {
+      return res.status(403).json({ error: 'Solo el admin puede cambiar contraseñas' })
+    }
+
+    const { userId, adminPassword, newPassword } = req.body
+
+    if (!userId || !adminPassword || !newPassword) {
+      return res
+        .status(400)
+        .json({ error: 'userId, adminPassword y newPassword son requeridos' })
+    }
+
+    if (String(newPassword).length < 4) {
+      return res
+        .status(400)
+        .json({ error: 'La nueva contraseña debe tener al menos 4 caracteres' })
+    }
+
+    const admin = await one(sql`
+      SELECT id, password_hash
+      FROM "users"
+      WHERE id = ${req.user.userId}
+      LIMIT 1`)
+
+    if (!admin) {
+      return res.status(401).json({ error: 'Admin no encontrado' })
+    }
+
+    const ok = await bcrypt.compare(adminPassword, admin.password_hash)
+    if (!ok) {
+      return res.status(401).json({ error: 'Clave de admin incorrecta' })
+    }
+
+    const hash = await bcrypt.hash(String(newPassword), 10)
+
+    const updated = await one(sql`
+      UPDATE "users"
+      SET password_hash = ${hash},
+          updated_at    = NOW()
+      WHERE id = ${userId}
+      RETURNING id, username, name`)
+
+    if (!updated) {
+      return res.status(404).json({ error: 'Usuario no encontrado' })
+    }
+
+    res.json({
+      ok: true,
+      user: {
+        id: updated.id,
+        username: updated.username,
+        name: updated.name
+      }
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Error al cambiar contraseña' })
   }
 })
 
@@ -155,7 +264,7 @@ app.get('/api/categories', async (_req, res) => {
 // VEHÍCULOS (sin Client, con contactName/contactPhone)
 // --------------------------------------------------
 
-// GET /api/vehicles
+// GET /api/vehicles – incluye info de categoría y fecha del último service
 app.get('/api/vehicles', async (_req, res) => {
   try {
     const rows = await many(sql`
@@ -202,7 +311,7 @@ app.get('/api/vehicles', async (_req, res) => {
   }
 })
 
-// GET /api/vehicles/:plate
+// GET /api/vehicles/:plate – detalle + services (con empleado)
 app.get('/api/vehicles/:plate', async (req, res) => {
   try {
     const plate = normalizePlate(req.params.plate)
@@ -231,13 +340,54 @@ app.get('/api/vehicles/:plate', async (req, res) => {
     if (!v) return res.status(404).json({ error: 'Not found' })
 
     const services = await many(sql`
-      SELECT id, "vehicleId", "date", "odometer", "summary",
-             "oil", "filterOil", "filterAir", "filterFuel", "filterCabin",
-             "otherServices", "totalPrice",
-             "createdAt", "updatedAt"
-      FROM "Service"
-      WHERE "vehicleId" = ${plate}
-      ORDER BY "date" DESC`)
+      SELECT
+        s.id,
+        s."vehicleId",
+        s."userId",
+        s."date",
+        s."odometer",
+        s."summary",
+        s."oil",
+        s."filterOil",
+        s."filterAir",
+        s."filterFuel",
+        s."filterCabin",
+        s."otherServices",
+        s."totalPrice",
+        s."createdAt",
+        s."updatedAt",
+        u."name"     AS "userName",
+        u."username" AS "userUsername"
+      FROM "Service" s
+      LEFT JOIN "users" u ON u.id = s."userId"
+      WHERE s."vehicleId" = ${plate}
+      ORDER BY s."date" DESC
+    `)
+
+    const shapedServices = services.map(s => ({
+      id: s.id,
+      vehicleId: s.vehicleId,
+      userId: s.userId,
+      date: s.date,
+      odometer: s.odometer,
+      summary: s.summary,
+      oil: s.oil,
+      filterOil: s.filterOil,
+      filterAir: s.filterAir,
+      filterFuel: s.filterFuel,
+      filterCabin: s.filterCabin,
+      otherServices: s.otherServices,
+      totalPrice: s.totalPrice,
+      createdAt: s.createdAt,
+      updatedAt: s.updatedAt,
+      employee: s.userId
+        ? {
+            id: s.userId,
+            name: s.userName,
+            username: s.userUsername
+          }
+        : null
+    }))
 
     res.json({
       plate: v.plate,
@@ -254,7 +404,7 @@ app.get('/api/vehicles/:plate', async (req, res) => {
       category: v.categoryId2
         ? { id: v.categoryId2, name: v.categoryName, everyDays: v.everyDays }
         : null,
-      services
+      services: shapedServices
     })
   } catch (err) {
     console.error(err)
@@ -262,19 +412,14 @@ app.get('/api/vehicles/:plate', async (req, res) => {
   }
 })
 
-// POST /api/vehicles  (ALTA NUEVO VEHÍCULO: teléfono obligatorio)
+// POST /api/vehicles
 app.post('/api/vehicles', async (req, res) => {
   try {
     const plate = normalizePlate(req.body.plate)
-    const { brand, model, year, categoryId, contactName } = req.body
-    const contactPhone = cleanPhone(req.body.contactPhone)
+    const { brand, model, year, categoryId, contactName, contactPhone } = req.body
 
     if (!plate) {
       return res.status(400).json({ error: 'Patente requerida' })
-    }
-
-    if (!contactPhone) {
-      return res.status(400).json({ error: 'El teléfono de contacto es obligatorio' })
     }
 
     const v = await one(sql`
@@ -289,7 +434,7 @@ app.post('/api/vehicles', async (req, res) => {
         ${year ?? null},
         ${categoryId ?? null},
         ${contactName ?? null},
-        ${contactPhone},
+        ${contactPhone ?? null},
         NOW(),
         NOW()
       )
@@ -307,7 +452,7 @@ app.post('/api/vehicles', async (req, res) => {
   }
 })
 
-// PUT /api/vehicles/:plate – actualizar datos + contacto (teléfono editable)
+// PUT /api/vehicles/:plate – actualizar datos básicos + contacto
 app.put('/api/vehicles/:plate', async (req, res) => {
   try {
     const plate = normalizePlate(req.params.plate)
@@ -318,9 +463,9 @@ app.put('/api/vehicles/:plate', async (req, res) => {
       model,
       year,
       categoryId,
-      contactName
+      contactName,
+      contactPhone
     } = req.body
-    const contactPhone = cleanPhone(req.body.contactPhone)
 
     const vehicle = await one(sql`
       UPDATE "Vehicle"
@@ -329,7 +474,7 @@ app.put('/api/vehicles/:plate', async (req, res) => {
           "year"         = ${year ?? null},
           "categoryId"   = ${categoryId ?? null},
           "contactName"  = ${contactName ?? null},
-          "contactPhone" = ${contactPhone},
+          "contactPhone" = ${contactPhone ?? null},
           "updatedAt"    = NOW()
       WHERE "plate" = ${plate}
       RETURNING *`)
@@ -348,6 +493,8 @@ app.put('/api/vehicles/:plate', async (req, res) => {
 // ------------------------
 // SERVICES
 // ------------------------
+
+// GET /api/services?from=YYYY-MM-DD&to=YYYY-MM-DD
 app.get('/api/services', async (req, res) => {
   try {
     const { from, to } = req.query
@@ -364,6 +511,7 @@ app.get('/api/services', async (req, res) => {
       SELECT
         s.id,
         s."vehicleId",
+        s."userId",
         s."date",
         s."odometer",
         s."summary",
@@ -379,9 +527,12 @@ app.get('/api/services', async (req, res) => {
         v."brand"        AS "vehicleBrand",
         v."model"        AS "vehicleModel",
         v."contactName"  AS "contactName",
-        v."contactPhone" AS "contactPhone"
+        v."contactPhone" AS "contactPhone",
+        u."name"         AS "userName",
+        u."username"     AS "userUsername"
       FROM "Service" s
       LEFT JOIN "Vehicle" v ON v."plate" = s."vehicleId"
+      LEFT JOIN "users"  u ON u.id       = s."userId"
       WHERE ${where}
       ORDER BY s."date" DESC, s.id DESC
     `)
@@ -389,6 +540,7 @@ app.get('/api/services', async (req, res) => {
     const shaped = rows.map((r) => ({
       id: r.id,
       vehicleId: r.vehicleId,
+      userId: r.userId,
       date: r.date,
       odometer: r.odometer,
       summary: r.summary,
@@ -408,7 +560,14 @@ app.get('/api/services', async (req, res) => {
       contact: {
         name: r.contactName,
         phone: r.contactPhone
-      }
+      },
+      employee: r.userId
+        ? {
+            id: r.userId,
+            name: r.userName,
+            username: r.userUsername
+          }
+        : null
     }))
 
     res.json(shaped)
@@ -438,16 +597,17 @@ app.post('/api/services', async (req, res) => {
       return res.status(400).json({ error: 'vehicleId y date son obligatorios' })
     }
 
-    const normalizedVehicleId = normalizePlate(vehicleId)
+    const userId = req.user ? req.user.userId : null
 
     const service = await one(sql`
       INSERT INTO "Service"
-        ("vehicleId", "date", "odometer", "summary",
+        ("vehicleId", "userId", "date", "odometer", "summary",
          "oil", "filterOil", "filterAir", "filterFuel", "filterCabin",
          "otherServices", "totalPrice",
          "createdAt", "updatedAt")
       VALUES (
-        ${normalizedVehicleId},
+        ${vehicleId},
+        ${userId},
         ${date},
         ${odometer ?? null},
         ${summary ?? null},
@@ -463,8 +623,8 @@ app.post('/api/services', async (req, res) => {
       )
       RETURNING *`)
 
-    // recalcular lastService del vehículo
-    await computeVehicleCategory(normalizedVehicleId)
+    // recalcular lastService/nextReminder del vehículo
+    await computeVehicleCategory(vehicleId)
 
     res.status(201).json(service)
   } catch (err) {
@@ -474,7 +634,7 @@ app.post('/api/services', async (req, res) => {
 })
 
 // --------------------------------------------------
-// MESSAGE TEMPLATE
+// MESSAGE TEMPLATE (PLANTILLAS DE MENSAJE)
 // --------------------------------------------------
 app.get('/api/message-templates', async (_req, res) => {
   try {
