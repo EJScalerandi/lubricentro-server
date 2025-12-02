@@ -35,28 +35,162 @@ function normalizePlate(plate) {
   return String(plate).toUpperCase().replace(/\s+/g, '')
 }
 
+// --- NUEVO: helpers para fechas / días hábiles ---
+
+// feriados fijos (mes-día). Podés agregar más si querés.
+const FIXED_HOLIDAYS_MMDD = new Set([
+  '01-01', // Año Nuevo
+  '03-24', // Memoria
+  '04-02', // Malvinas
+  '05-01', // Trabajo
+  '05-25', // Revolución de Mayo
+  '06-20', // Belgrano
+  '07-09', // Independencia
+  '08-17', // San Martín
+  '10-12', // Diversidad cultural
+  '11-20', // Soberanía
+  '12-08', // Inmaculada
+  '12-25'  // Navidad
+])
+
+function isWeekend(date) {
+  const day = date.getDay() // 0 domingo, 6 sábado
+  return day === 0 || day === 6
+}
+
+function isHoliday(date) {
+  const mm = String(date.getMonth() + 1).padStart(2, '0')
+  const dd = String(date.getDate()).padStart(2, '0')
+  const key = `${mm}-${dd}`
+  return FIXED_HOLIDAYS_MMDD.has(key)
+}
+
+function getNextBusinessDay(date) {
+  const d = new Date(date)
+  // avanzar hasta que no sea fin de semana ni feriado
+  while (isWeekend(d) || isHoliday(d)) {
+    d.setDate(d.getDate() + 1)
+  }
+  return d
+}
+
+function diffInDays(a, b) {
+  // diferencia en días entre dos fechas, normalizado a medianoche
+  const msPerDay = 24 * 60 * 60 * 1000
+  const aUTC = Date.UTC(a.getFullYear(), a.getMonth(), a.getDate())
+  const bUTC = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate())
+  return Math.round((aUTC - bUTC) / msPerDay)
+}
+
+function addDays(baseDate, days) {
+  const d = new Date(baseDate)
+  d.setDate(d.getDate() + days)
+  return d
+}
+
 // Recalcula lastService y nextReminder para un vehículo
 async function computeVehicleCategory(plate) {
   if (!plate) return
   try {
+    // Traemos TODOS los services de ese vehículo, ordenados del más nuevo al más viejo
+    const services = await many(sql`
+      SELECT "date"
+      FROM "Service"
+      WHERE "vehicleId" = ${plate}
+      ORDER BY "date" DESC
+    `)
+
+    if (!services || services.length === 0) {
+      // Sin services -> limpiamos lastService y nextReminder
+      await one(sql`
+        UPDATE "Vehicle"
+        SET
+          "lastService" = NULL,
+          "nextReminder" = NULL,
+          "updatedAt" = NOW()
+        WHERE "plate" = ${plate}
+        RETURNING "plate"
+      `)
+      return
+    }
+
+    // Deduplicamos por día (si hay services el mismo día, se consideran uno solo)
+    const uniqueDates = []
+    const seen = new Set()
+
+    for (const row of services) {
+      const d = row.date
+      if (!d) continue
+      const key = d.toISOString().slice(0, 10) // YYYY-MM-DD
+      if (!seen.has(key)) {
+        seen.add(key)
+        uniqueDates.push(new Date(d))
+      }
+    }
+
+    if (uniqueDates.length === 0) {
+      await one(sql`
+        UPDATE "Vehicle"
+        SET
+          "lastService" = NULL,
+          "nextReminder" = NULL,
+          "updatedAt" = NOW()
+        WHERE "plate" = ${plate}
+        RETURNING "plate"
+      `)
+      return
+    }
+
+    // El último service es el más reciente
+    const lastService = uniqueDates[0]
+
+    // Regla de días:
+    // - Si hay solo un service: 180 días
+    // - Si hay 2 o más: usamos SOLO los dos más recientes (uniqueDates[0] y uniqueDates[1])
+    //   calculamos la diferencia y aplicamos:
+    //   >180      -> 180
+    //   180..120  -> 120
+    //   120..90   -> 90
+    //   90..60    -> 60
+    //   <60       -> 45
+    let daysToAdd = 180
+
+    if (uniqueDates.length >= 2) {
+      const d1 = uniqueDates[0] // más reciente
+      const d2 = uniqueDates[1] // segundo más reciente
+      const diff = Math.abs(diffInDays(d1, d2))
+
+      if (diff > 180) {
+        daysToAdd = 180
+      } else if (diff > 120) {
+        daysToAdd = 120
+      } else if (diff > 90) {
+        daysToAdd = 90
+      } else if (diff > 60) {
+        daysToAdd = 60
+      } else {
+        daysToAdd = 45
+      }
+    } else {
+      // solo un service
+      daysToAdd = 180
+    }
+
+    // Fecha tentativa = último service + daysToAdd
+    let nextReminder = addDays(lastService, daysToAdd)
+
+    // Ajustar a día hábil (no sábado, no domingo, no feriado)
+    nextReminder = getNextBusinessDay(nextReminder)
+
+    // Guardamos en Vehicle
     await one(sql`
-      UPDATE "Vehicle" v
+      UPDATE "Vehicle"
       SET
-        "lastService" = sub.last_service,
-        "nextReminder" = CASE
-          WHEN sub.last_service IS NOT NULL AND c."everyDays" IS NOT NULL
-            THEN sub.last_service + (c."everyDays" || ' days')::interval
-          ELSE NULL
-        END,
-        "updatedAt" = NOW()
-      FROM (
-        SELECT MAX(s."date") AS last_service
-        FROM "Service" s
-        WHERE s."vehicleId" = ${plate}
-      ) sub
-      LEFT JOIN "Category" c ON c.id = v."categoryId"
-      WHERE v."plate" = ${plate}
-      RETURNING v."plate"
+        "lastService"  = ${lastService},
+        "nextReminder" = ${nextReminder},
+        "updatedAt"    = NOW()
+      WHERE "plate" = ${plate}
+      RETURNING "plate"
     `)
   } catch (err) {
     console.error('Error en computeVehicleCategory:', err.message)
@@ -151,7 +285,6 @@ app.post('/api/login', async (req, res) => {
 // ADMIN: USUARIOS / EMPLEADOS
 // ------------------------
 
-// Lista de usuarios (empleados), solo para admin
 // Lista de usuarios (empleados), accesible para cualquier usuario logueado
 app.get('/api/users', async (req, res) => {
   try {
@@ -182,8 +315,7 @@ app.get('/api/users', async (req, res) => {
   }
 })
 
-
-// *** NUEVO: crear usuario (solo admin) ***
+// Crear usuario (solo admin)
 app.post('/api/users', async (req, res) => {
   try {
     if (!req.user || !req.user.isAdmin) {
@@ -650,14 +782,25 @@ app.post('/api/services', async (req, res) => {
       filterFuel,
       filterCabin,
       otherServices,
-      totalPrice
+      totalPrice,
+      userId // <-- puede venir del front (empleado seleccionado)
     } = req.body
 
     if (!vehicleId || !date) {
       return res.status(400).json({ error: 'vehicleId y date son obligatorios' })
     }
 
-    const userId = req.user ? req.user.userId : null
+    // priorizamos el userId que viene en el body (seleccionado en el front)
+    let finalUserId = null
+    if (userId != null) {
+      finalUserId = Number(userId)
+      if (Number.isNaN(finalUserId)) {
+        finalUserId = null
+      }
+    } else if (req.user && req.user.userId) {
+      // fallback: el usuario logueado
+      finalUserId = req.user.userId
+    }
 
     const service = await one(sql`
       INSERT INTO "Service"
@@ -667,7 +810,7 @@ app.post('/api/services', async (req, res) => {
          "createdAt", "updatedAt")
       VALUES (
         ${vehicleId},
-        ${userId},
+        ${finalUserId},
         ${date},
         ${odometer ?? null},
         ${summary ?? null},
@@ -683,6 +826,7 @@ app.post('/api/services', async (req, res) => {
       )
       RETURNING *`)
 
+    // recalcular lastService/nextReminder del vehículo con la lógica nueva
     await computeVehicleCategory(vehicleId)
 
     res.status(201).json(service)
