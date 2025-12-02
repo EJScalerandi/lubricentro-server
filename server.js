@@ -35,6 +35,12 @@ function normalizePlate(plate) {
   return String(plate).toUpperCase().replace(/\s+/g, '')
 }
 
+function cleanPhone(raw) {
+  if (raw === null || raw === undefined) return null
+  const s = String(raw).replace(/\s+/g, '').trim()
+  return s || null
+}
+
 // Recalcula lastService (y deja nextReminder en NULL por ahora)
 async function computeVehicleCategory(plate) {
   const normalized = normalizePlate(plate)
@@ -66,12 +72,10 @@ app.use(cors())
 app.use(bodyParser.json())
 
 // Middleware simple de autenticación con JWT
-// (solo se usa si el front manda Authorization: Bearer xxx)
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || ''
   const [type, token] = auth.split(' ')
   if (!token || type !== 'Bearer') {
-    // si no hay token, simplemente seguimos
     return next()
   }
 
@@ -96,7 +100,6 @@ app.get('/health', (_req, res) => {
 // ------------------------
 // LOGIN
 // ------------------------
-// Tabla users: id, username, password_hash, created_at, updated_at
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body
@@ -152,7 +155,7 @@ app.get('/api/categories', async (_req, res) => {
 // VEHÍCULOS (sin Client, con contactName/contactPhone)
 // --------------------------------------------------
 
-// GET /api/vehicles – incluye info de categoría y fecha del último service
+// GET /api/vehicles
 app.get('/api/vehicles', async (_req, res) => {
   try {
     const rows = await many(sql`
@@ -199,7 +202,7 @@ app.get('/api/vehicles', async (_req, res) => {
   }
 })
 
-// GET /api/vehicles/:plate – detalle + services
+// GET /api/vehicles/:plate
 app.get('/api/vehicles/:plate', async (req, res) => {
   try {
     const plate = normalizePlate(req.params.plate)
@@ -259,14 +262,19 @@ app.get('/api/vehicles/:plate', async (req, res) => {
   }
 })
 
-// POST /api/vehicles
+// POST /api/vehicles  (ALTA NUEVO VEHÍCULO: teléfono obligatorio)
 app.post('/api/vehicles', async (req, res) => {
   try {
     const plate = normalizePlate(req.body.plate)
-    const { brand, model, year, categoryId, contactName, contactPhone } = req.body
+    const { brand, model, year, categoryId, contactName } = req.body
+    const contactPhone = cleanPhone(req.body.contactPhone)
 
     if (!plate) {
       return res.status(400).json({ error: 'Patente requerida' })
+    }
+
+    if (!contactPhone) {
+      return res.status(400).json({ error: 'El teléfono de contacto es obligatorio' })
     }
 
     const v = await one(sql`
@@ -281,7 +289,7 @@ app.post('/api/vehicles', async (req, res) => {
         ${year ?? null},
         ${categoryId ?? null},
         ${contactName ?? null},
-        ${contactPhone ?? null},
+        ${contactPhone},
         NOW(),
         NOW()
       )
@@ -299,7 +307,7 @@ app.post('/api/vehicles', async (req, res) => {
   }
 })
 
-// PUT /api/vehicles/:plate – actualizar datos básicos + contacto
+// PUT /api/vehicles/:plate – actualizar datos + contacto (teléfono editable)
 app.put('/api/vehicles/:plate', async (req, res) => {
   try {
     const plate = normalizePlate(req.params.plate)
@@ -310,9 +318,9 @@ app.put('/api/vehicles/:plate', async (req, res) => {
       model,
       year,
       categoryId,
-      contactName,
-      contactPhone
+      contactName
     } = req.body
+    const contactPhone = cleanPhone(req.body.contactPhone)
 
     const vehicle = await one(sql`
       UPDATE "Vehicle"
@@ -321,7 +329,7 @@ app.put('/api/vehicles/:plate', async (req, res) => {
           "year"         = ${year ?? null},
           "categoryId"   = ${categoryId ?? null},
           "contactName"  = ${contactName ?? null},
-          "contactPhone" = ${contactPhone ?? null},
+          "contactPhone" = ${contactPhone},
           "updatedAt"    = NOW()
       WHERE "plate" = ${plate}
       RETURNING *`)
@@ -340,8 +348,6 @@ app.put('/api/vehicles/:plate', async (req, res) => {
 // ------------------------
 // SERVICES
 // ------------------------
-
-// GET /api/services?from=YYYY-MM-DD&to=YYYY-MM-DD
 app.get('/api/services', async (req, res) => {
   try {
     const { from, to } = req.query
@@ -468,7 +474,7 @@ app.post('/api/services', async (req, res) => {
 })
 
 // --------------------------------------------------
-// MESSAGE TEMPLATE (PLANTILLAS DE MENSAJE)
+// MESSAGE TEMPLATE
 // --------------------------------------------------
 app.get('/api/message-templates', async (_req, res) => {
   try {
