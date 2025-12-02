@@ -132,7 +132,6 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: '7d' }
     )
 
-    // Podés usar sólo token (como hasta ahora) o también estos datos en el front
     res.json({
       token,
       user: {
@@ -152,7 +151,7 @@ app.post('/api/login', async (req, res) => {
 // ADMIN: USUARIOS / EMPLEADOS
 // ------------------------
 
-// Lista de usuarios (empleados), solo para admin
+// Lista de usuarios (empleados), solo para admin (para la página de administración)
 app.get('/api/users', async (req, res) => {
   try {
     if (!req.user || !req.user.isAdmin) {
@@ -178,6 +177,29 @@ app.get('/api/users', async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Error al obtener usuarios' })
+  }
+})
+
+// Endpoint de empleados para el combo del service (cualquier usuario logueado)
+app.get('/api/employees', async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'No autorizado' })
+    }
+
+    const rows = await many(sql`
+      SELECT
+        id,
+        username,
+        name
+      FROM "users"
+      ORDER BY name NULLS LAST, username ASC
+    `)
+
+    res.json(rows)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Error al obtener empleados' })
   }
 })
 
@@ -590,14 +612,23 @@ app.post('/api/services', async (req, res) => {
       filterFuel,
       filterCabin,
       otherServices,
-      totalPrice
+      totalPrice,
+      userId: bodyUserId
     } = req.body
 
     if (!vehicleId || !date) {
       return res.status(400).json({ error: 'vehicleId y date son obligatorios' })
     }
 
-    const userId = req.user ? req.user.userId : null
+    // Si viene userId desde el front, lo usamos.
+    // Si no viene, usamos el del token (como antes).
+    let userId = null
+    if (bodyUserId != null && bodyUserId !== '') {
+      const parsed = Number(bodyUserId)
+      userId = Number.isNaN(parsed) ? null : parsed
+    } else if (req.user) {
+      userId = req.user.userId
+    }
 
     const service = await one(sql`
       INSERT INTO "Service"
