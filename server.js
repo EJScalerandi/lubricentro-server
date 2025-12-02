@@ -151,7 +151,7 @@ app.post('/api/login', async (req, res) => {
 // ADMIN: USUARIOS / EMPLEADOS
 // ------------------------
 
-// Lista de usuarios (empleados), solo para admin (para la página de administración)
+// Lista de usuarios (empleados), solo para admin
 app.get('/api/users', async (req, res) => {
   try {
     if (!req.user || !req.user.isAdmin) {
@@ -180,26 +180,63 @@ app.get('/api/users', async (req, res) => {
   }
 })
 
-// Endpoint de empleados para el combo del service (cualquier usuario logueado)
-app.get('/api/employees', async (req, res) => {
+// *** NUEVO: crear usuario (solo admin) ***
+app.post('/api/users', async (req, res) => {
   try {
-    if (!req.user) {
-      return res.status(401).json({ error: 'No autorizado' })
+    if (!req.user || !req.user.isAdmin) {
+      return res.status(403).json({ error: 'Solo el admin puede crear usuarios' })
     }
 
-    const rows = await many(sql`
-      SELECT
+    const { name, username, password, isAdmin } = req.body
+
+    if (!username || !password) {
+      return res
+        .status(400)
+        .json({ error: 'username y password son requeridos' })
+    }
+
+    if (String(password).length < 4) {
+      return res
+        .status(400)
+        .json({ error: 'La contraseña debe tener al menos 4 caracteres' })
+    }
+
+    // ¿ya existe?
+    const existing = await one(sql`
+      SELECT id FROM "users" WHERE username = ${username} LIMIT 1
+    `)
+    if (existing) {
+      return res
+        .status(400)
+        .json({ error: 'Ya existe un usuario con ese username' })
+    }
+
+    const hash = await bcrypt.hash(String(password), 10)
+
+    const newUser = await one(sql`
+      INSERT INTO "users"
+        ("username", "password_hash", "name", "is_admin", "created_at", "updated_at")
+      VALUES (
+        ${username},
+        ${hash},
+        ${name ?? null},
+        ${!!isAdmin},
+        NOW(),
+        NOW()
+      )
+      RETURNING
         id,
         username,
-        name
-      FROM "users"
-      ORDER BY name NULLS LAST, username ASC
+        name,
+        is_admin AS "isAdmin",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
     `)
 
-    res.json(rows)
+    res.status(201).json(newUser)
   } catch (err) {
     console.error(err)
-    res.status(500).json({ error: 'Error al obtener empleados' })
+    res.status(500).json({ error: 'Error al crear usuario' })
   }
 })
 
@@ -283,10 +320,8 @@ app.get('/api/categories', async (_req, res) => {
 })
 
 // --------------------------------------------------
-// VEHÍCULOS (sin Client, con contactName/contactPhone)
+// VEHÍCULOS
 // --------------------------------------------------
-
-// GET /api/vehicles – incluye info de categoría y fecha del último service
 app.get('/api/vehicles', async (_req, res) => {
   try {
     const rows = await many(sql`
@@ -474,7 +509,7 @@ app.post('/api/vehicles', async (req, res) => {
   }
 })
 
-// PUT /api/vehicles/:plate – actualizar datos básicos + contacto
+// PUT /api/vehicles/:plate
 app.put('/api/vehicles/:plate', async (req, res) => {
   try {
     const plate = normalizePlate(req.params.plate)
@@ -516,7 +551,7 @@ app.put('/api/vehicles/:plate', async (req, res) => {
 // SERVICES
 // ------------------------
 
-// GET /api/services?from=YYYY-MM-DD&to=YYYY-MM-DD
+// GET /api/services
 app.get('/api/services', async (req, res) => {
   try {
     const { from, to } = req.query
@@ -612,23 +647,14 @@ app.post('/api/services', async (req, res) => {
       filterFuel,
       filterCabin,
       otherServices,
-      totalPrice,
-      userId: bodyUserId
+      totalPrice
     } = req.body
 
     if (!vehicleId || !date) {
       return res.status(400).json({ error: 'vehicleId y date son obligatorios' })
     }
 
-    // Si viene userId desde el front, lo usamos.
-    // Si no viene, usamos el del token (como antes).
-    let userId = null
-    if (bodyUserId != null && bodyUserId !== '') {
-      const parsed = Number(bodyUserId)
-      userId = Number.isNaN(parsed) ? null : parsed
-    } else if (req.user) {
-      userId = req.user.userId
-    }
+    const userId = req.user ? req.user.userId : null
 
     const service = await one(sql`
       INSERT INTO "Service"
@@ -654,7 +680,6 @@ app.post('/api/services', async (req, res) => {
       )
       RETURNING *`)
 
-    // recalcular lastService/nextReminder del vehículo
     await computeVehicleCategory(vehicleId)
 
     res.status(201).json(service)
@@ -665,7 +690,7 @@ app.post('/api/services', async (req, res) => {
 })
 
 // --------------------------------------------------
-// MESSAGE TEMPLATE (PLANTILLAS DE MENSAJE)
+// MESSAGE TEMPLATE
 // --------------------------------------------------
 app.get('/api/message-templates', async (_req, res) => {
   try {
