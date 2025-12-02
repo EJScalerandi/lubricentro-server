@@ -152,10 +152,12 @@ app.post('/api/login', async (req, res) => {
 // ------------------------
 
 // Lista de usuarios (empleados), solo para admin
+// Lista de usuarios (empleados), accesible para cualquier usuario logueado
 app.get('/api/users', async (req, res) => {
   try {
-    if (!req.user || !req.user.isAdmin) {
-      return res.status(403).json({ error: 'Solo el admin puede ver usuarios' })
+    // solo verificamos que esté logueado
+    if (!req.user) {
+      return res.status(401).json({ error: 'No autenticado' })
     }
 
     const currentId = req.user.userId
@@ -179,6 +181,7 @@ app.get('/api/users', async (req, res) => {
     res.status(500).json({ error: 'Error al obtener usuarios' })
   }
 })
+
 
 // *** NUEVO: crear usuario (solo admin) ***
 app.post('/api/users', async (req, res) => {
