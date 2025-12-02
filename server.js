@@ -35,31 +35,25 @@ function normalizePlate(plate) {
   return String(plate).toUpperCase().replace(/\s+/g, '')
 }
 
-// Recalcula lastService y nextReminder para un vehículo
+// Recalcula lastService (y deja nextReminder en NULL por ahora)
 async function computeVehicleCategory(plate) {
   const normalized = normalizePlate(plate)
   if (!normalized) return
 
   try {
-    await one(sql`
+    await sql`
       UPDATE "Vehicle" v
       SET
         "lastService" = sub.last_service,
-        "nextReminder" = CASE
-          WHEN sub.last_service IS NOT NULL AND c."everyDays" IS NOT NULL
-            THEN sub.last_service + (c."everyDays" * INTERVAL '1 day')
-          ELSE NULL
-        END,
+        "nextReminder" = NULL,
         "updatedAt" = NOW()
       FROM (
         SELECT MAX(s."date") AS last_service
         FROM "Service" s
         WHERE s."vehicleId" = ${normalized}
       ) sub
-      LEFT JOIN "Category" c ON c.id = v."categoryId"
       WHERE v."plate" = ${normalized}
-      RETURNING v."plate"
-    `)
+    `
   } catch (err) {
     console.error('Error en computeVehicleCategory:', err.message)
   }
@@ -72,7 +66,7 @@ app.use(cors())
 app.use(bodyParser.json())
 
 // Middleware simple de autenticación con JWT
-// (de momento SOLO se usa si el front manda Authorization: Bearer xxx)
+// (solo se usa si el front manda Authorization: Bearer xxx)
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || ''
   const [type, token] = auth.split(' ')
@@ -463,7 +457,7 @@ app.post('/api/services', async (req, res) => {
       )
       RETURNING *`)
 
-    // recalcular lastService/nextReminder del vehículo
+    // recalcular lastService del vehículo
     await computeVehicleCategory(normalizedVehicleId)
 
     res.status(201).json(service)
