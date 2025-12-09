@@ -82,6 +82,7 @@ function diffInDays(a, b) {
   return Math.round((aUTC - bUTC) / msPerDay)
 }
 
+// ✅ Versión "local" para evitar el -1 día por timezone
 function parseDate(value) {
   if (!value) return null
   if (value instanceof Date) return value
@@ -92,15 +93,15 @@ function parseDate(value) {
   const m = Number(mStr)
   const d = Number(dStr)
   if (!y || !m || !d) return null
-  // Usamos UTC para evitar quilombos de timezone
-  return new Date(Date.UTC(y, m - 1, d))
+  // Fecha local, sin UTC
+  return new Date(y, m - 1, d)
 }
 
 function addDays(baseDate, days) {
   const base = parseDate(baseDate)
   if (!base) return null
   const d = new Date(base.getTime())
-  d.setUTCDate(d.getUTCDate() + days)
+  d.setDate(d.getDate() + days)
   return d
 }
 
@@ -353,10 +354,10 @@ app.post('/api/users', async (req, res) => {
     }
 
     // ¿ya existe?
-    theExisting = await one(sql`
+    const existing = await one(sql`
       SELECT id FROM "users" WHERE username = ${username} LIMIT 1
     `)
-    if (theExisting) {
+    if (existing) {
       return res
         .status(400)
         .json({ error: 'Ya existe un usuario con ese username' })
@@ -660,7 +661,6 @@ app.post('/api/vehicles', async (req, res) => {
   }
 })
 
-
 // PUT /api/vehicles/:plate
 app.put('/api/vehicles/:plate', async (req, res) => {
   try {
@@ -685,7 +685,7 @@ app.put('/api/vehicles/:plate', async (req, res) => {
           "categoryId"   = ${categoryId ?? null},
           "contactName"  = ${contactName ?? null},
           "contactPhone" = ${contactPhone ?? null},
-          "nextReminder" = ${nextReminder ?? null}, -- <-- NUEVO
+          "nextReminder" = ${nextReminder ?? null},
           "updatedAt"    = NOW()
       WHERE "plate" = ${plate}
       RETURNING *`)
@@ -754,7 +754,8 @@ app.get('/api/services', async (req, res) => {
       userId: r.userId,
       date: r.date,
       odometer: r.odometer,
-      summary: r.summary,
+      // Para listado general, no queremos usar el resumen viejo
+      summary: null,
       oil: r.oil,
       filterOil: r.filterOil,
       filterAir: r.filterAir,
@@ -794,7 +795,7 @@ app.post('/api/services', async (req, res) => {
       vehicleId,
       date,
       odometer,
-      summary,
+      // summary,  // 👈 lo ignoramos, siempre vamos a guardar null
       oil,
       filterOil,
       filterAir,
@@ -832,7 +833,7 @@ app.post('/api/services', async (req, res) => {
         ${finalUserId},
         ${date},
         ${odometer ?? null},
-        ${summary ?? null},
+        ${null},               -- ✅ siempre guardamos summary = NULL
         ${oil ?? null},
         ${filterOil ?? null},
         ${filterAir ?? null},
