@@ -1170,6 +1170,62 @@ app.post('/webhook/whatsapp', (req, res) => {
   // Podrías guardar en DB si querés, acá solo confirmamos 200
   res.sendStatus(200)
 })
+// ------------------------
+// WhatsApp: envío de texto (single o bulk)
+// ------------------------
+app.post('/api/whatsapp/send-bulk-text', async (req, res) => {
+  try {
+    if (!WHATSAPP_ENABLED) {
+      return res.status(400).json({ error: 'WhatsApp está deshabilitado en el servidor' })
+    }
+
+    const { to, body, messages } = req.body || {}
+
+    // Normalizamos distintas formas de llamar al endpoint:
+    // 1) { to: "549..." , body: "texto" }
+    // 2) { to: ["549...", "549..."], body: "texto" }
+    // 3) { messages: [ { to: "...", body: "..." }, ... ] }
+    const items = []
+
+    if (Array.isArray(messages)) {
+      for (const m of messages) {
+        if (m && m.to && m.body) {
+          items.push({ to: m.to, body: m.body })
+        }
+      }
+    } else if (Array.isArray(to)) {
+      for (const phone of to) {
+        if (phone) {
+          items.push({ to: phone, body })
+        }
+      }
+    } else if (to && body) {
+      items.push({ to, body })
+    }
+
+    if (!items.length) {
+      return res.status(400).json({
+        error: 'Formato inválido. Esperado: { to, body } o { to:[...], body } o { messages:[{to,body},...] }'
+      })
+    }
+
+    const results = []
+    for (const item of items) {
+      try {
+        const r = await sendWhatsAppTextMessage(item.to, item.body)
+        results.push({ to: item.to, ok: true, response: r.data || null })
+      } catch (err) {
+        console.error('[WHATSAPP] Falló envío a', item.to, err)
+        results.push({ to: item.to, ok: false, error: err.message })
+      }
+    }
+
+    return res.json({ ok: true, count: results.length, results })
+  } catch (err) {
+    console.error('Error en /api/whatsapp/send-bulk-text:', err)
+    res.status(500).json({ error: 'Error interno enviando WhatsApp' })
+  }
+})
 
 // ------------------------
 // Arranque del server
