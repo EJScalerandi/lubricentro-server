@@ -290,6 +290,73 @@ function sendWhatsAppTemplate(to) {
 }
 
 // ------------------------
+// Helper para WhatsApp Cloud API (texto directo)
+// ------------------------
+function sendWhatsAppTextMessage(to, body) {
+  return new Promise((resolve, reject) => {
+    if (!WHATSAPP_ENABLED) {
+      console.log('[WHATSAPP TEXT] Deshabilitado. Simulando envío de texto a:', to)
+      return resolve({ simulated: true })
+    }
+
+    if (!WHATSAPP_PHONE_NUMBER_ID || !WHATSAPP_TOKEN) {
+      return reject(new Error('WhatsApp API no configurada correctamente'))
+    }
+
+    const payload = JSON.stringify({
+      messaging_product: 'whatsapp',
+      to,
+      type: 'text',
+      text: {
+        preview_url: false,
+        body
+      }
+    })
+
+    const options = {
+      hostname: 'graph.facebook.com',
+      path: `/v21.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    }
+
+    const req = https.request(options, (res) => {
+      let bodyResp = ''
+      res.on('data', (chunk) => {
+        bodyResp += chunk
+      })
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try {
+            const json = bodyResp ? JSON.parse(bodyResp) : null
+            console.log('[WHATSAPP TEXT] OK ->', to, json)
+            resolve(json)
+          } catch (_e) {
+            console.log('[WHATSAPP TEXT] OK (sin JSON parseable) ->', to, bodyResp)
+            resolve({ raw: bodyResp })
+          }
+        } else {
+          console.error('[WHATSAPP TEXT] ERROR', res.statusCode, bodyResp)
+          reject(new Error(bodyResp || `WhatsApp status ${res.statusCode}`))
+        }
+      })
+    })
+
+    req.on('error', (err) => {
+      console.error('[WHATSAPP TEXT] request error:', err)
+      reject(err)
+    })
+
+    req.write(payload)
+    req.end()
+  })
+}
+
+// ------------------------
 // Middlewares
 // ------------------------
 app.use(cors())
@@ -1170,6 +1237,7 @@ app.post('/webhook/whatsapp', (req, res) => {
   // Podrías guardar en DB si querés, acá solo confirmamos 200
   res.sendStatus(200)
 })
+
 // ------------------------
 // WhatsApp: envío de texto (single o bulk)
 // ------------------------
@@ -1205,7 +1273,8 @@ app.post('/api/whatsapp/send-bulk-text', async (req, res) => {
 
     if (!items.length) {
       return res.status(400).json({
-        error: 'Formato inválido. Esperado: { to, body } o { to:[...], body } o { messages:[{to,body},...] }'
+        error:
+          'Formato inválido. Esperado: { to, body } o { to:[...], body } o { messages:[{to,body},...] }'
       })
     }
 
@@ -1213,7 +1282,7 @@ app.post('/api/whatsapp/send-bulk-text', async (req, res) => {
     for (const item of items) {
       try {
         const r = await sendWhatsAppTextMessage(item.to, item.body)
-        results.push({ to: item.to, ok: true, response: r.data || null })
+        results.push({ to: item.to, ok: true, response: r || null })
       } catch (err) {
         console.error('[WHATSAPP] Falló envío a', item.to, err)
         results.push({ to: item.to, ok: false, error: err.message })
