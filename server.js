@@ -290,15 +290,14 @@ function sendWhatsAppTemplate(to) {
 }
 
 // ------------------------
-// Helper para WhatsApp Cloud API (texto directo)
+// Helper para WhatsApp Cloud API (texto libre)
 // ------------------------
 function sendWhatsAppTextMessage(to, body) {
   return new Promise((resolve, reject) => {
     if (!WHATSAPP_ENABLED) {
-      console.log('[WHATSAPP TEXT] Deshabilitado. Simulando envío de texto a:', to)
+      console.log('[WHATSAPP TEXT] Deshabilitado. Simulando envío a:', to, '->', body)
       return resolve({ simulated: true })
     }
-
     if (!WHATSAPP_PHONE_NUMBER_ID || !WHATSAPP_TOKEN) {
       return reject(new Error('WhatsApp API no configurada correctamente'))
     }
@@ -325,23 +324,23 @@ function sendWhatsAppTextMessage(to, body) {
     }
 
     const req = https.request(options, (res) => {
-      let bodyResp = ''
+      let data = ''
       res.on('data', (chunk) => {
-        bodyResp += chunk
+        data += chunk
       })
       res.on('end', () => {
         if (res.statusCode >= 200 && res.statusCode < 300) {
           try {
-            const json = bodyResp ? JSON.parse(bodyResp) : null
+            const json = data ? JSON.parse(data) : null
             console.log('[WHATSAPP TEXT] OK ->', to, json)
-            resolve(json)
+            resolve({ data: json })
           } catch (_e) {
-            console.log('[WHATSAPP TEXT] OK (sin JSON parseable) ->', to, bodyResp)
-            resolve({ raw: bodyResp })
+            console.log('[WHATSAPP TEXT] OK (raw)->', to, data)
+            resolve({ data: data })
           }
         } else {
-          console.error('[WHATSAPP TEXT] ERROR', res.statusCode, bodyResp)
-          reject(new Error(bodyResp || `WhatsApp status ${res.statusCode}`))
+          console.error('[WHATSAPP TEXT] ERROR', res.statusCode, data)
+          reject(new Error(data || `WhatsApp TEXT status ${res.statusCode}`))
         }
       })
     })
@@ -389,7 +388,6 @@ app.get('/health', (_req, res) => {
 // ------------------------
 // LOGIN
 // ------------------------
-// Tabla users: id, username, password_hash, name, is_admin, created_at, updated_at
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body
@@ -441,8 +439,6 @@ app.post('/api/login', async (req, res) => {
 // ------------------------
 // ADMIN: USUARIOS / EMPLEADOS
 // ------------------------
-
-// Lista de usuarios (empleados), accesible para cualquier usuario logueado
 app.get('/api/users', async (req, res) => {
   try {
     if (!req.user) {
@@ -467,7 +463,6 @@ app.get('/api/users', async (req, res) => {
   }
 })
 
-// Crear usuario (solo admin)
 app.post('/api/users', async (req, res) => {
   try {
     if (!req.user || !req.user.isAdmin) {
@@ -523,7 +518,6 @@ app.post('/api/users', async (req, res) => {
   }
 })
 
-// Cambiar password de un usuario (pide clave del admin)
 app.post('/api/users/change-password', async (req, res) => {
   try {
     if (!req.user || !req.user.isAdmin) {
@@ -656,7 +650,6 @@ app.get('/api/vehicles', async (_req, res) => {
   }
 })
 
-// GET /api/vehicles/:plate – detalle + services
 app.get('/api/vehicles/:plate', async (req, res) => {
   try {
     const plate = normalizePlate(req.params.plate)
@@ -762,7 +755,6 @@ app.get('/api/vehicles/:plate', async (req, res) => {
   }
 })
 
-// POST /api/vehicles
 app.post('/api/vehicles', async (req, res) => {
   try {
     const plate = normalizePlate(req.body.plate)
@@ -803,7 +795,6 @@ app.post('/api/vehicles', async (req, res) => {
   }
 })
 
-// PUT /api/vehicles/:plate
 app.put('/api/vehicles/:plate', async (req, res) => {
   try {
     const plate = normalizePlate(req.params.plate)
@@ -847,8 +838,6 @@ app.put('/api/vehicles/:plate', async (req, res) => {
 // ------------------------
 // SERVICES
 // ------------------------
-
-// GET /api/services
 app.get('/api/services', async (req, res) => {
   try {
     const { from, to } = req.query
@@ -897,7 +886,7 @@ app.get('/api/services', async (req, res) => {
       userId: r.userId,
       date: r.date,
       odometer: r.odometer,
-      summary: null, // no usamos el summary viejo en listado
+      summary: null,
       oil: r.oil,
       filterOil: r.filterOil,
       filterAir: r.filterAir,
@@ -931,14 +920,12 @@ app.get('/api/services', async (req, res) => {
   }
 })
 
-// POST /api/services
 app.post('/api/services', async (req, res) => {
   try {
     const {
       vehicleId,
       date,
       odometer,
-      // summary,
       oil,
       filterOil,
       filterAir,
@@ -953,7 +940,6 @@ app.post('/api/services', async (req, res) => {
       return res.status(400).json({ error: 'vehicleId y date son obligatorios' })
     }
 
-    // priorizamos el userId que viene en el body
     let finalUserId = null
     if (userId != null) {
       finalUserId = Number(userId)
@@ -986,7 +972,7 @@ app.post('/api/services', async (req, res) => {
         ${finalUserId},
         ${date},
         ${odometer ?? null},
-        ${null}, -- siempre guardamos summary NULL
+        ${null},
         ${oil ?? null},
         ${filterOil ?? null},
         ${filterAir ?? null},
@@ -1121,9 +1107,6 @@ app.delete('/api/message-templates/:id', async (req, res) => {
 /**
  * POST /api/whatsapp/broadcast
  * body: { plates: ["ABC123", "AA000AA", ...] }
- *
- * Usa la plantilla oficial de WhatsApp (recordatorio_de_ubicacion, es_AR)
- * y la envía a los clientes cuyos vehículos tengan teléfono.
  */
 app.post('/api/whatsapp/broadcast', async (req, res) => {
   try {
@@ -1135,26 +1118,41 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
       })
     }
 
+    // Normalizamos y deduplicamos patentes
+    const normalizedPlates = Array.from(
+      new Set(
+        plates
+          .map((p) => normalizePlate(p))
+          .filter(Boolean)
+      )
+    )
+
+    if (normalizedPlates.length === 0) {
+      return res.status(400).json({ error: 'No hay patentes válidas' })
+    }
+
     if (!WHATSAPP_PHONE_NUMBER_ID || !WHATSAPP_TOKEN) {
       return res
         .status(500)
         .json({ error: 'WhatsApp Cloud API no está configurado en el servidor' })
     }
 
-    // Normalizamos patentes
-    const normalizedPlates = plates
-      .map((p) => normalizePlate(p))
-      .filter(Boolean)
+    // Evitamos ANY(...) y arrays de Postgres para no disparar el 22P02.
+    // Hacemos consultas simples por cada patente y armamos un map.
+    const vehiclesMap = new Map()
 
-    if (normalizedPlates.length === 0) {
-      return res.status(400).json({ error: 'No hay patentes válidas' })
+    for (const plate of normalizedPlates) {
+      const rows = await many(sql`
+        SELECT "plate", "contactPhone"
+        FROM "Vehicle"
+        WHERE "plate" = ${plate}
+      `)
+      for (const row of rows) {
+        vehiclesMap.set(row.plate, row)
+      }
     }
 
-    const vehicles = await many(sql`
-      SELECT "plate", "contactPhone"
-      FROM "Vehicle"
-      WHERE "plate" = ANY(${sql.array(normalizedPlates, 'text')})
-    `)
+    const vehicles = Array.from(vehiclesMap.values())
 
     const successes = []
     const errors = []
@@ -1201,10 +1199,6 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
 // --------------------------------------------------
 // WHATSAPP WEBHOOK (ENTRANTE)
 // --------------------------------------------------
-/**
- * GET /webhook/whatsapp
- * verificación que hace Meta al configurar el webhook.
- */
 app.get('/webhook/whatsapp', (req, res) => {
   const mode = req.query['hub.mode']
   const token = req.query['hub.verify_token']
@@ -1219,11 +1213,6 @@ app.get('/webhook/whatsapp', (req, res) => {
   return res.sendStatus(403)
 })
 
-/**
- * POST /webhook/whatsapp
- * Meta manda acá todos los eventos (mensajes entrantes, etc.).
- * Por ahora solo lo logueamos.
- */
 app.post('/webhook/whatsapp', (req, res) => {
   try {
     console.log(
@@ -1233,8 +1222,6 @@ app.post('/webhook/whatsapp', (req, res) => {
   } catch (e) {
     console.error('[WHATSAPP] Error logueando body:', e)
   }
-
-  // Podrías guardar en DB si querés, acá solo confirmamos 200
   res.sendStatus(200)
 })
 
@@ -1249,10 +1236,6 @@ app.post('/api/whatsapp/send-bulk-text', async (req, res) => {
 
     const { to, body, messages } = req.body || {}
 
-    // Normalizamos distintas formas de llamar al endpoint:
-    // 1) { to: "549..." , body: "texto" }
-    // 2) { to: ["549...", "549..."], body: "texto" }
-    // 3) { messages: [ { to: "...", body: "..." }, ... ] }
     const items = []
 
     if (Array.isArray(messages)) {
@@ -1282,7 +1265,7 @@ app.post('/api/whatsapp/send-bulk-text', async (req, res) => {
     for (const item of items) {
       try {
         const r = await sendWhatsAppTextMessage(item.to, item.body)
-        results.push({ to: item.to, ok: true, response: r || null })
+        results.push({ to: item.to, ok: true, response: r.data || null })
       } catch (err) {
         console.error('[WHATSAPP] Falló envío a', item.to, err)
         results.push({ to: item.to, ok: false, error: err.message })
