@@ -1,4 +1,3 @@
-// server.js
 require('dotenv').config()
 
 const express = require('express')
@@ -7,10 +6,25 @@ const bodyParser = require('body-parser')
 const postgres = require('postgres')
 const bcrypt = require('bcryptjs')
 const jwt = require('jsonwebtoken')
+const https = require('https')
 
 const app = express()
+
 const PORT = process.env.PORT || 3001
 const JWT_SECRET = process.env.JWT_SECRET || 'CAMBIAR_ESTE_SECRET'
+
+// ------------------------
+// WhatsApp config
+// ------------------------
+const WHATSAPP_ENABLED = process.env.WHATSAPP_ENABLED === 'true'
+const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN
+// Nombre y lenguaje de la plantilla oficial de WhatsApp
+// Ej: recordatorio_de_ubicacion · Spanish (ARG)
+const WHATSAPP_TEMPLATE = process.env.WHATSAPP_TEMPLATE || 'recordatorio_de_ubicacion'
+const WHATSAPP_TEMPLATE_LANG = process.env.WHATSAPP_TEMPLATE_LANG || 'es_AR'
+const WHATSAPP_VERIFY_TOKEN =
+  process.env.WHATSAPP_VERIFY_TOKEN || 'lubricentro_verify_token'
 
 // ------------------------
 // Base de datos (postgres.js)
@@ -35,9 +49,19 @@ function normalizePlate(plate) {
   return String(plate).toUpperCase().replace(/\s+/g, '')
 }
 
-// --- NUEVO: helpers para fechas / días hábiles ---
+function normalizePhoneToWa(phone) {
+  if (!phone) return null
+  let cleaned = String(phone).replace(/\D/g, '')
+  if (!cleaned) return null
+  if (!cleaned.startsWith('54')) {
+    cleaned = '54' + cleaned
+  }
+  return cleaned
+}
 
-// feriados fijos (mes-día). Podés agregar más si querés.
+// --- Helpers fechas / días hábiles ---
+
+// feriados fijos (mes-día).
 const FIXED_HOLIDAYS_MMDD = new Set([
   '01-01', // Año Nuevo
   '03-24', // Memoria
@@ -67,7 +91,6 @@ function isHoliday(date) {
 
 function getNextBusinessDay(date) {
   const d = new Date(date)
-  // avanzar hasta que no sea fin de semana ni feriado
   while (isWeekend(d) || isHoliday(d)) {
     d.setDate(d.getDate() + 1)
   }
@@ -75,7 +98,6 @@ function getNextBusinessDay(date) {
 }
 
 function diffInDays(a, b) {
-  // diferencia en días entre dos fechas, normalizado a medianoche
   const msPerDay = 24 * 60 * 60 * 1000
   const aUTC = Date.UTC(a.getFullYear(), a.getMonth(), a.getDate())
   const bUTC = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate())
@@ -86,14 +108,14 @@ function diffInDays(a, b) {
 function parseDate(value) {
   if (!value) return null
   if (value instanceof Date) return value
-  // Asumimos string "YYYY-MM-DD" o similar
+
   const s = String(value).slice(0, 10) // YYYY-MM-DD
   const [yStr, mStr, dStr] = s.split('-')
   const y = Number(yStr)
   const m = Number(mStr)
   const d = Number(dStr)
   if (!y || !m || !d) return null
-  // Fecha local, sin UTC
+
   return new Date(y, m - 1, d)
 }
 
@@ -118,27 +140,24 @@ async function computeVehicleCategory(plate) {
     `)
 
     if (!services || services.length === 0) {
-      // Sin services -> limpiamos lastService y nextReminder
       await one(sql`
         UPDATE "Vehicle"
-        SET
-          "lastService" = NULL,
-          "nextReminder" = NULL,
-          "updatedAt" = NOW()
+        SET "lastService" = NULL,
+            "nextReminder" = NULL,
+            "updatedAt" = NOW()
         WHERE "plate" = ${plate}
         RETURNING "plate"
       `)
       return
     }
 
-    // Deduplicamos por día (si hay services el mismo día, se consideran uno solo)
+    // Deduplicamos por día
     const uniqueDates = []
     const seen = new Set()
-
     for (const row of services) {
       const d = parseDate(row.date)
       if (!d) continue
-      const key = d.toISOString().slice(0, 10) // YYYY-MM-DD
+      const key = d.toISOString().slice(0, 10)
       if (!seen.has(key)) {
         seen.add(key)
         uniqueDates.push(d)
@@ -148,10 +167,9 @@ async function computeVehicleCategory(plate) {
     if (uniqueDates.length === 0) {
       await one(sql`
         UPDATE "Vehicle"
-        SET
-          "lastService" = NULL,
-          "nextReminder" = NULL,
-          "updatedAt" = NOW()
+        SET "lastService" = NULL,
+            "nextReminder" = NULL,
+            "updatedAt" = NOW()
         WHERE "plate" = ${plate}
         RETURNING "plate"
       `)
@@ -163,18 +181,11 @@ async function computeVehicleCategory(plate) {
 
     // Regla de días:
     // - Si hay solo un service: 180 días
-    // - Si hay 2 o más: usamos SOLO los dos más recientes (uniqueDates[0] y uniqueDates[1])
-    //   calculamos la diferencia y aplicamos:
-    //   >180      -> 180
-    //   180..120  -> 120
-    //   120..90   -> 90
-    //   90..60    -> 60
-    //   <60       -> 45
+    // - Si hay 2 o más: usamos solo los dos más recientes
     let daysToAdd = 180
-
     if (uniqueDates.length >= 2) {
-      const d1 = uniqueDates[0] // más reciente
-      const d2 = uniqueDates[1] // segundo más reciente
+      const d1 = uniqueDates[0]
+      const d2 = uniqueDates[1]
       const diff = Math.abs(diffInDays(d1, d2))
 
       if (diff > 180) {
@@ -189,29 +200,93 @@ async function computeVehicleCategory(plate) {
         daysToAdd = 45
       }
     } else {
-      // solo un service
       daysToAdd = 180
     }
 
-    // Fecha tentativa = último service + daysToAdd
     let nextReminder = addDays(lastService, daysToAdd)
-
-    // Ajustar a día hábil (no sábado, no domingo, no feriado)
     nextReminder = getNextBusinessDay(nextReminder)
 
-    // Guardamos en Vehicle
     await one(sql`
       UPDATE "Vehicle"
-      SET
-        "lastService"  = ${lastService},
-        "nextReminder" = ${nextReminder},
-        "updatedAt"    = NOW()
+      SET "lastService" = ${lastService},
+          "nextReminder" = ${nextReminder},
+          "updatedAt" = NOW()
       WHERE "plate" = ${plate}
       RETURNING "plate"
     `)
   } catch (err) {
     console.error('Error en computeVehicleCategory:', err.message)
   }
+}
+
+// ------------------------
+// Helper para WhatsApp Cloud API (plantilla)
+// ------------------------
+function sendWhatsAppTemplate(to) {
+  return new Promise((resolve, reject) => {
+    if (!WHATSAPP_ENABLED) {
+      console.log('[WHATSAPP] Deshabilitado. Simulando envío a:', to)
+      return resolve({ simulated: true })
+    }
+    if (!WHATSAPP_PHONE_NUMBER_ID || !WHATSAPP_TOKEN) {
+      return reject(new Error('WhatsApp API no configurada correctamente'))
+    }
+
+    const payload = JSON.stringify({
+      messaging_product: 'whatsapp',
+      to,
+      type: 'template',
+      template: {
+        name: WHATSAPP_TEMPLATE,
+        language: {
+          code: WHATSAPP_TEMPLATE_LANG
+        }
+        // Si tu plantilla usa variables, acá se agregan "components"
+        // components: [...]
+      }
+    })
+
+    const options = {
+      hostname: 'graph.facebook.com',
+      path: `/v21.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    }
+
+    const req = https.request(options, (res) => {
+      let body = ''
+      res.on('data', (chunk) => {
+        body += chunk
+      })
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try {
+            const json = body ? JSON.parse(body) : null
+            console.log('[WHATSAPP] OK ->', to, json)
+            resolve(json)
+          } catch (_e) {
+            console.log('[WHATSAPP] OK (sin JSON parseable) ->', to, body)
+            resolve({ raw: body })
+          }
+        } else {
+          console.error('[WHATSAPP] ERROR', res.statusCode, body)
+          reject(new Error(body || `WhatsApp status ${res.statusCode}`))
+        }
+      })
+    })
+
+    req.on('error', (err) => {
+      console.error('[WHATSAPP] request error:', err)
+      reject(err)
+    })
+
+    req.write(payload)
+    req.end()
+  })
 }
 
 // ------------------------
@@ -227,17 +302,14 @@ function authMiddleware(req, _res, next) {
   if (!token || type !== 'Bearer') {
     return next()
   }
-
   try {
-    const payload = jwt.verify(token, JWT_SECRET)
-    // payload: { userId, username, isAdmin }
+    const payload = jwt.verify(token, JWT_SECRET) // { userId, username, isAdmin }
     req.user = payload
     return next()
   } catch (_err) {
     return next()
   }
 }
-
 app.use(authMiddleware)
 
 // ------------------------
@@ -262,7 +334,8 @@ app.post('/api/login', async (req, res) => {
       SELECT id, username, password_hash, name, is_admin
       FROM "users"
       WHERE username = ${username}
-      LIMIT 1`)
+      LIMIT 1
+    `)
 
     if (!user) {
       return res.status(401).json({ error: 'Usuario o contraseña incorrectos' })
@@ -305,26 +378,21 @@ app.post('/api/login', async (req, res) => {
 // Lista de usuarios (empleados), accesible para cualquier usuario logueado
 app.get('/api/users', async (req, res) => {
   try {
-    // solo verificamos que esté logueado
     if (!req.user) {
       return res.status(401).json({ error: 'No autenticado' })
     }
-
     const currentId = req.user.userId
-
     const rows = await many(sql`
-      SELECT
-        id,
-        username,
-        name,
-        is_admin AS "isAdmin",
-        created_at AS "createdAt",
-        updated_at AS "updatedAt"
+      SELECT id,
+             username,
+             name,
+             is_admin AS "isAdmin",
+             created_at AS "createdAt",
+             updated_at AS "updatedAt"
       FROM "users"
       WHERE id <> ${currentId}
       ORDER BY username ASC
     `)
-
     res.json(rows)
   } catch (err) {
     console.error(err)
@@ -340,22 +408,20 @@ app.post('/api/users', async (req, res) => {
     }
 
     const { name, username, password, isAdmin } = req.body
-
     if (!username || !password) {
-      return res
-        .status(400)
-        .json({ error: 'username y password son requeridos' })
+      return res.status(400).json({ error: 'username y password son requeridos' })
     }
-
     if (String(password).length < 4) {
       return res
         .status(400)
         .json({ error: 'La contraseña debe tener al menos 4 caracteres' })
     }
 
-    // ¿ya existe?
     const existing = await one(sql`
-      SELECT id FROM "users" WHERE username = ${username} LIMIT 1
+      SELECT id
+      FROM "users"
+      WHERE username = ${username}
+      LIMIT 1
     `)
     if (existing) {
       return res
@@ -364,10 +430,8 @@ app.post('/api/users', async (req, res) => {
     }
 
     const hash = await bcrypt.hash(String(password), 10)
-
     const newUser = await one(sql`
-      INSERT INTO "users"
-        ("username", "password_hash", "name", "is_admin", "created_at", "updated_at")
+      INSERT INTO "users" ("username", "password_hash", "name", "is_admin", "created_at", "updated_at")
       VALUES (
         ${username},
         ${hash},
@@ -400,13 +464,11 @@ app.post('/api/users/change-password', async (req, res) => {
     }
 
     const { userId, adminPassword, newPassword } = req.body
-
     if (!userId || !adminPassword || !newPassword) {
       return res
         .status(400)
         .json({ error: 'userId, adminPassword y newPassword son requeridos' })
     }
-
     if (String(newPassword).length < 4) {
       return res
         .status(400)
@@ -417,7 +479,8 @@ app.post('/api/users/change-password', async (req, res) => {
       SELECT id, password_hash
       FROM "users"
       WHERE id = ${req.user.userId}
-      LIMIT 1`)
+      LIMIT 1
+    `)
 
     if (!admin) {
       return res.status(401).json({ error: 'Admin no encontrado' })
@@ -429,13 +492,13 @@ app.post('/api/users/change-password', async (req, res) => {
     }
 
     const hash = await bcrypt.hash(String(newPassword), 10)
-
     const updated = await one(sql`
       UPDATE "users"
       SET password_hash = ${hash},
-          updated_at    = NOW()
+          updated_at = NOW()
       WHERE id = ${userId}
-      RETURNING id, username, name`)
+      RETURNING id, username, name
+    `)
 
     if (!updated) {
       return res.status(404).json({ error: 'Usuario no encontrado' })
@@ -463,7 +526,8 @@ app.get('/api/categories', async (_req, res) => {
     const rows = await many(sql`
       SELECT id, name, "everyDays", "createdAt", "updatedAt"
       FROM "Category"
-      ORDER BY "name" ASC`)
+      ORDER BY "name" ASC
+    `)
     res.json(rows)
   } catch (err) {
     console.error(err)
@@ -489,14 +553,15 @@ app.get('/api/vehicles', async (_req, res) => {
         v."contactPhone",
         v."createdAt",
         v."updatedAt",
-        c.id   AS "categoryId2",
+        c.id AS "categoryId2",
         c.name AS "categoryName",
         c."everyDays"
       FROM "Vehicle" v
       LEFT JOIN "Category" c ON c.id = v."categoryId"
-      ORDER BY v."plate" ASC`)
+      ORDER BY v."plate" ASC
+    `)
 
-    const shaped = rows.map(r => ({
+    const shaped = rows.map((r) => ({
       plate: r.plate,
       brand: r.brand,
       model: r.model,
@@ -509,7 +574,11 @@ app.get('/api/vehicles', async (_req, res) => {
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
       category: r.categoryId2
-        ? { id: r.categoryId2, name: r.categoryName, everyDays: r.everyDays }
+        ? {
+            id: r.categoryId2,
+            name: r.categoryName,
+            everyDays: r.everyDays
+          }
         : null
     }))
 
@@ -520,7 +589,7 @@ app.get('/api/vehicles', async (_req, res) => {
   }
 })
 
-// GET /api/vehicles/:plate – detalle + services (con empleado)
+// GET /api/vehicles/:plate – detalle + services
 app.get('/api/vehicles/:plate', async (req, res) => {
   try {
     const plate = normalizePlate(req.params.plate)
@@ -539,12 +608,13 @@ app.get('/api/vehicles/:plate', async (req, res) => {
         v."contactPhone",
         v."createdAt",
         v."updatedAt",
-        c.id   AS "categoryId2",
+        c.id AS "categoryId2",
         c.name AS "categoryName",
         c."everyDays"
       FROM "Vehicle" v
       LEFT JOIN "Category" c ON c.id = v."categoryId"
-      WHERE v."plate" = ${plate}`)
+      WHERE v."plate" = ${plate}
+    `)
 
     if (!v) return res.status(404).json({ error: 'Not found' })
 
@@ -565,7 +635,7 @@ app.get('/api/vehicles/:plate', async (req, res) => {
         s."totalPrice",
         s."createdAt",
         s."updatedAt",
-        u."name"     AS "userName",
+        u."name" AS "userName",
         u."username" AS "userUsername"
       FROM "Service" s
       LEFT JOIN "users" u ON u.id = s."userId"
@@ -573,7 +643,7 @@ app.get('/api/vehicles/:plate', async (req, res) => {
       ORDER BY s."date" DESC
     `)
 
-    const shapedServices = services.map(s => ({
+    const shapedServices = services.map((s) => ({
       id: s.id,
       vehicleId: s.vehicleId,
       userId: s.userId,
@@ -611,7 +681,11 @@ app.get('/api/vehicles/:plate', async (req, res) => {
       createdAt: v.createdAt,
       updatedAt: v.updatedAt,
       category: v.categoryId2
-        ? { id: v.categoryId2, name: v.categoryName, everyDays: v.everyDays }
+        ? {
+            id: v.categoryId2,
+            name: v.categoryName,
+            everyDays: v.everyDays
+          }
         : null,
       services: shapedServices
     })
@@ -632,10 +706,11 @@ app.post('/api/vehicles', async (req, res) => {
     }
 
     const v = await one(sql`
-      INSERT INTO "Vehicle"
-        ("plate", "brand", "model", "year", "categoryId",
-         "contactName", "contactPhone",
-         "createdAt", "updatedAt")
+      INSERT INTO "Vehicle" (
+        "plate", "brand", "model", "year",
+        "categoryId", "contactName", "contactPhone",
+        "createdAt", "updatedAt"
+      )
       VALUES (
         ${plate},
         ${brand ?? null},
@@ -647,10 +722,10 @@ app.post('/api/vehicles', async (req, res) => {
         NOW(),
         NOW()
       )
-      RETURNING *`)
+      RETURNING *
+    `)
 
     await computeVehicleCategory(plate)
-
     res.status(201).json(v)
   } catch (err) {
     console.error(err)
@@ -674,7 +749,7 @@ app.put('/api/vehicles/:plate', async (req, res) => {
       categoryId,
       contactName,
       contactPhone,
-      nextReminder // <-- NUEVO
+      nextReminder
     } = req.body
 
     const vehicle = await one(sql`
@@ -688,7 +763,8 @@ app.put('/api/vehicles/:plate', async (req, res) => {
           "nextReminder" = ${nextReminder ?? null},
           "updatedAt"    = NOW()
       WHERE "plate" = ${plate}
-      RETURNING *`)
+      RETURNING *
+    `)
 
     if (!vehicle) {
       return res.status(404).json({ error: 'Vehículo no encontrado' })
@@ -735,15 +811,15 @@ app.get('/api/services', async (req, res) => {
         s."totalPrice",
         s."createdAt",
         s."updatedAt",
-        v."brand"        AS "vehicleBrand",
-        v."model"        AS "vehicleModel",
-        v."contactName"  AS "contactName",
+        v."brand" AS "vehicleBrand",
+        v."model" AS "vehicleModel",
+        v."contactName" AS "contactName",
         v."contactPhone" AS "contactPhone",
-        u."name"         AS "userName",
-        u."username"     AS "userUsername"
+        u."name" AS "userName",
+        u."username" AS "userUsername"
       FROM "Service" s
       LEFT JOIN "Vehicle" v ON v."plate" = s."vehicleId"
-      LEFT JOIN "users"  u ON u.id       = s."userId"
+      LEFT JOIN "users" u   ON u.id      = s."userId"
       WHERE ${where}
       ORDER BY s."date" DESC, s.id DESC
     `)
@@ -754,8 +830,7 @@ app.get('/api/services', async (req, res) => {
       userId: r.userId,
       date: r.date,
       odometer: r.odometer,
-      // Para listado general, no queremos usar el resumen viejo
-      summary: null,
+      summary: null, // no usamos el summary viejo en listado
       oil: r.oil,
       filterOil: r.filterOil,
       filterAir: r.filterAir,
@@ -789,13 +864,14 @@ app.get('/api/services', async (req, res) => {
   }
 })
 
+// POST /api/services
 app.post('/api/services', async (req, res) => {
   try {
     const {
       vehicleId,
       date,
       odometer,
-      // summary,  // 👈 lo ignoramos, siempre vamos a guardar null
+      // summary,
       oil,
       filterOil,
       filterAir,
@@ -803,14 +879,14 @@ app.post('/api/services', async (req, res) => {
       filterCabin,
       otherServices,
       totalPrice,
-      userId // <-- puede venir del front (empleado seleccionado)
+      userId
     } = req.body
 
     if (!vehicleId || !date) {
       return res.status(400).json({ error: 'vehicleId y date son obligatorios' })
     }
 
-    // priorizamos el userId que viene en el body (seleccionado en el front)
+    // priorizamos el userId que viene en el body
     let finalUserId = null
     if (userId != null) {
       finalUserId = Number(userId)
@@ -818,22 +894,32 @@ app.post('/api/services', async (req, res) => {
         finalUserId = null
       }
     } else if (req.user && req.user.userId) {
-      // fallback: el usuario logueado
       finalUserId = req.user.userId
     }
 
     const service = await one(sql`
-      INSERT INTO "Service"
-        ("vehicleId", "userId", "date", "odometer", "summary",
-         "oil", "filterOil", "filterAir", "filterFuel", "filterCabin",
-         "otherServices", "totalPrice",
-         "createdAt", "updatedAt")
+      INSERT INTO "Service" (
+        "vehicleId",
+        "userId",
+        "date",
+        "odometer",
+        "summary",
+        "oil",
+        "filterOil",
+        "filterAir",
+        "filterFuel",
+        "filterCabin",
+        "otherServices",
+        "totalPrice",
+        "createdAt",
+        "updatedAt"
+      )
       VALUES (
         ${vehicleId},
         ${finalUserId},
         ${date},
         ${odometer ?? null},
-        ${null},               -- ✅ siempre guardamos summary = NULL
+        ${null}, -- siempre guardamos summary NULL
         ${oil ?? null},
         ${filterOil ?? null},
         ${filterAir ?? null},
@@ -844,11 +930,10 @@ app.post('/api/services', async (req, res) => {
         NOW(),
         NOW()
       )
-      RETURNING *`)
+      RETURNING *
+    `)
 
-    // recalcular lastService/nextReminder del vehículo con la lógica nueva
     await computeVehicleCategory(vehicleId)
-
     res.status(201).json(service)
   } catch (err) {
     console.error(err)
@@ -857,14 +942,15 @@ app.post('/api/services', async (req, res) => {
 })
 
 // --------------------------------------------------
-// MESSAGE TEMPLATE
+// MESSAGE TEMPLATE (internas del sistema, no WA oficial)
 // --------------------------------------------------
 app.get('/api/message-templates', async (_req, res) => {
   try {
     const rows = await many(sql`
       SELECT id, name, body, "createdAt", "updatedAt"
       FROM "MessageTemplate"
-      ORDER BY id ASC`)
+      ORDER BY id ASC
+    `)
     res.json(rows)
   } catch (err) {
     console.error(err)
@@ -880,10 +966,10 @@ app.get('/api/message-templates/:id', async (req, res) => {
     const tpl = await one(sql`
       SELECT id, name, body, "createdAt", "updatedAt"
       FROM "MessageTemplate"
-      WHERE id = ${id}`)
+      WHERE id = ${id}
+    `)
 
     if (!tpl) return res.status(404).json({ error: 'No encontrada' })
-
     res.json(tpl)
   } catch (err) {
     console.error(err)
@@ -899,15 +985,15 @@ app.post('/api/message-templates', async (req, res) => {
     }
 
     const tpl = await one(sql`
-      INSERT INTO "MessageTemplate"
-        ("name", "body", "createdAt", "updatedAt")
+      INSERT INTO "MessageTemplate" ("name", "body", "createdAt", "updatedAt")
       VALUES (
         ${name},
         ${body},
         NOW(),
         NOW()
       )
-      RETURNING id, name, body, "createdAt", "updatedAt"`)
+      RETURNING id, name, body, "createdAt", "updatedAt"
+    `)
 
     res.status(201).json(tpl)
   } catch (err) {
@@ -932,10 +1018,10 @@ app.put('/api/message-templates/:id', async (req, res) => {
           "body" = ${body},
           "updatedAt" = NOW()
       WHERE id = ${id}
-      RETURNING id, name, body, "createdAt", "updatedAt"`)
+      RETURNING id, name, body, "createdAt", "updatedAt"
+    `)
 
     if (!tpl) return res.status(404).json({ error: 'No encontrada' })
-
     res.json(tpl)
   } catch (err) {
     console.error(err)
@@ -951,15 +1037,138 @@ app.delete('/api/message-templates/:id', async (req, res) => {
     const tpl = await one(sql`
       DELETE FROM "MessageTemplate"
       WHERE id = ${id}
-      RETURNING id`)
+      RETURNING id
+    `)
 
     if (!tpl) return res.status(404).json({ error: 'No encontrada' })
-
     res.json({ ok: true })
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Error al eliminar plantilla' })
   }
+})
+
+// --------------------------------------------------
+// WHATSAPP: BROADCAST CON PLANTILLA OFICIAL
+// --------------------------------------------------
+/**
+ * POST /api/whatsapp/broadcast
+ * body: { plates: ["ABC123", "AA000AA", ...] }
+ *
+ * Usa la plantilla oficial de WhatsApp (recordatorio_de_ubicacion, es_AR)
+ * y la envía a los clientes cuyos vehículos tengan teléfono.
+ */
+app.post('/api/whatsapp/broadcast', async (req, res) => {
+  try {
+    const { plates } = req.body
+
+    if (!Array.isArray(plates) || plates.length === 0) {
+      return res.status(400).json({
+        error: 'plates es requerido y debe ser un array con al menos una patente'
+      })
+    }
+
+    if (!WHATSAPP_PHONE_NUMBER_ID || !WHATSAPP_TOKEN) {
+      return res
+        .status(500)
+        .json({ error: 'WhatsApp Cloud API no está configurado en el servidor' })
+    }
+
+    // Normalizamos patentes
+    const normalizedPlates = plates
+      .map((p) => normalizePlate(p))
+      .filter(Boolean)
+
+    if (normalizedPlates.length === 0) {
+      return res.status(400).json({ error: 'No hay patentes válidas' })
+    }
+
+    const vehicles = await many(sql`
+      SELECT "plate", "contactPhone"
+      FROM "Vehicle"
+      WHERE "plate" = ANY(${sql.array(normalizedPlates, 'text')})
+    `)
+
+    const successes = []
+    const errors = []
+
+    for (const v of vehicles) {
+      const waPhone = normalizePhoneToWa(v.contactPhone)
+      if (!waPhone) {
+        console.warn('[WHATSAPP] Vehículo sin teléfono válido:', v.plate)
+        errors.push({
+          plate: v.plate,
+          reason: 'Teléfono inválido o faltante'
+        })
+        continue
+      }
+
+      try {
+        await sendWhatsAppTemplate(waPhone)
+        successes.push({ plate: v.plate, phone: waPhone })
+      } catch (err) {
+        console.error('[WHATSAPP] Error enviando a', v.plate, err.message)
+        errors.push({
+          plate: v.plate,
+          phone: waPhone,
+          reason: err.message
+        })
+      }
+    }
+
+    res.json({
+      ok: true,
+      template: WHATSAPP_TEMPLATE,
+      language: WHATSAPP_TEMPLATE_LANG,
+      sent: successes.length,
+      failed: errors.length,
+      successes,
+      errors
+    })
+  } catch (err) {
+    console.error('[WHATSAPP] broadcast error:', err)
+    res.status(500).json({ error: 'Error interno enviando mensajes de WhatsApp' })
+  }
+})
+
+// --------------------------------------------------
+// WHATSAPP WEBHOOK (ENTRANTE)
+// --------------------------------------------------
+/**
+ * GET /webhook/whatsapp
+ * verificación que hace Meta al configurar el webhook.
+ */
+app.get('/webhook/whatsapp', (req, res) => {
+  const mode = req.query['hub.mode']
+  const token = req.query['hub.verify_token']
+  const challenge = req.query['hub.challenge']
+
+  if (mode === 'subscribe' && token === WHATSAPP_VERIFY_TOKEN) {
+    console.log('[WHATSAPP] Webhook verificado correctamente')
+    return res.status(200).send(challenge)
+  }
+
+  console.warn('[WHATSAPP] Verificación de webhook fallida')
+  return res.sendStatus(403)
+})
+
+/**
+ * POST /webhook/whatsapp
+ * Meta manda acá todos los eventos (mensajes entrantes, etc.).
+ * Por ahora solo lo logueamos.
+ */
+app.post('/webhook/whatsapp', (req, res) => {
+  try {
+    console.log(
+      '📩 [WHATSAPP] Webhook payload:\n',
+      JSON.stringify(req.body, null, 2)
+    )
+  } catch (e) {
+    console.error('[WHATSAPP] Error logueando body:', e)
+  }
+
+  // Podrías guardar en DB si querés, acá solo confirmamos 200
+  res.sendStatus(200)
 })
 
 // ------------------------
