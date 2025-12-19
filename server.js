@@ -54,7 +54,7 @@ function normalizePhoneToWa(phone) {
   let cleaned = String(phone).replace(/\D/g, '')
   if (!cleaned) return null
   if (!cleaned.startsWith('54')) {
-    cleaned = '54' + cleaned
+    cleaned = '+54' + cleaned
   }
   return cleaned
 }
