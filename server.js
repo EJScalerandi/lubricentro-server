@@ -49,14 +49,48 @@ function normalizePlate(plate) {
   return String(plate).toUpperCase().replace(/\s+/g, '')
 }
 
+/**
+ * Normaliza teléfonos a formato de WhatsApp solo dígitos: 549 + código de área + número.
+ * Ejemplos de entrada válidos:
+ *  - "0351 15 791-6505"
+ *  - "+54 9 351 7916505"
+ *  - "3517916505"
+ *  - "5493517916505"
+ *
+ * Salida siempre: "5493517916505"
+ */
 function normalizePhoneToWa(phone) {
   if (!phone) return null
   let cleaned = String(phone).replace(/\D/g, '')
   if (!cleaned) return null
-  if (!cleaned.startsWith('549')) {
-    cleaned = '+549' + cleaned
+
+  // Si ya viene bien como 549..., lo dejamos
+  if (cleaned.startsWith('549')) {
+    return cleaned
   }
-  return cleaned
+
+  // Si viene con prefijo internacional 00 (ej: 0054...)
+  if (cleaned.startsWith('00')) {
+    cleaned = cleaned.slice(2) // quita "00" → queda 54...
+  }
+
+  // Si arranca con 54, lo sacamos para después anteponer 549
+  if (cleaned.startsWith('54')) {
+    cleaned = cleaned.slice(2)
+  }
+
+  // Si arranca con 0 (código de área con 0), lo sacamos
+  if (cleaned.startsWith('0')) {
+    cleaned = cleaned.slice(1)
+  }
+
+  // Si arranca con 15 (celu viejo con 15), lo sacamos
+  if (cleaned.startsWith('15')) {
+    cleaned = cleaned.slice(2)
+  }
+
+  // Resultado final: solo dígitos, formato 549 + código de área + número
+  return '549' + cleaned
 }
 
 // --- Helpers fechas / días hábiles ---
