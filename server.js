@@ -869,6 +869,75 @@ app.put('/api/vehicles/:plate', async (req, res) => {
   }
 })
 
+
+app.patch('/api/vehicles/:plate/plate', async (req, res) => {
+  try {
+    const oldPlate = normalizePlate(req.params.plate)
+    const newPlate = normalizePlate(req.body?.newPlate || req.body?.plate)
+
+    if (!oldPlate) return res.status(400).json({ error: 'Patente inválida' })
+    if (!newPlate) return res.status(400).json({ error: 'Nueva patente requerida' })
+
+    if (oldPlate === newPlate) {
+      const existing = await one(sql`SELECT * FROM "Vehicle" WHERE "plate" = ${oldPlate}`)
+      if (!existing) return res.status(404).json({ error: 'Vehículo no encontrado' })
+      return res.json(existing)
+    }
+
+    let updatedVehicle = null
+
+    await sql.begin(async (tx) => {
+      const vRows = await tx`SELECT * FROM "Vehicle" WHERE "plate" = ${oldPlate}`
+      const v = vRows[0] || null
+      if (!v) {
+        // Abort transaction by throwing
+        const err = new Error('NOT_FOUND')
+        err.httpStatus = 404
+        throw err
+      }
+
+      const conflictRows = await tx`SELECT "plate" FROM "Vehicle" WHERE "plate" = ${newPlate}`
+      if (conflictRows.length > 0) {
+        const err = new Error('CONFLICT')
+        err.httpStatus = 400
+        throw err
+      }
+
+      const upRows = await tx`
+        UPDATE "Vehicle"
+        SET "plate" = ${newPlate},
+            "updatedAt" = NOW()
+        WHERE "plate" = ${oldPlate}
+        RETURNING *
+      `
+      updatedVehicle = upRows[0] || null
+
+      // Propagamos el cambio a los services ya cargados con la patente vieja
+      await tx`
+        UPDATE "Service"
+        SET "vehicleId" = ${newPlate},
+            "updatedAt" = NOW()
+        WHERE "vehicleId" = ${oldPlate}
+      `
+    })
+
+    await computeVehicleCategory(newPlate)
+    return res.json(updatedVehicle)
+  } catch (err) {
+    if (err && err.httpStatus === 404) {
+      return res.status(404).json({ error: 'Vehículo no encontrado' })
+    }
+    if (err && err.httpStatus === 400 && err.message === 'CONFLICT') {
+      return res.status(400).json({ error: 'Ya existe un vehículo con esa patente' })
+    }
+    console.error(err)
+    if (err && err.code === '23505') {
+      return res.status(400).json({ error: 'Ya existe un vehículo con esa patente' })
+    }
+    return res.status(500).json({ error: 'Error al actualizar la patente' })
+  }
+})
+
 // ------------------------
 // SERVICES
 // ------------------------
