@@ -25,6 +25,10 @@ const WHATSAPP_TEMPLATE = process.env.WHATSAPP_TEMPLATE || 'recordatorio_de_ubic
 const WHATSAPP_TEMPLATE_LANG = process.env.WHATSAPP_TEMPLATE_LANG || 'es_AR'
 const WHATSAPP_VERIFY_TOKEN =
   process.env.WHATSAPP_VERIFY_TOKEN || 'lubricentro_verify_token'
+const WHATSAPP_BROADCAST_TEST_PHONES = [
+  '3572400170',
+  '3512011806'
+]
 
 // ------------------------
 // Base de datos (postgres.js)
@@ -91,6 +95,18 @@ function normalizePhoneToWa(phone) {
 
   // Resultado final: solo dígitos, formato 549 + código de área + número
   return '549' + cleaned
+}
+
+function normalizePhoneListToWa(phones) {
+  if (!Array.isArray(phones)) return []
+
+  return Array.from(
+    new Set(
+      phones
+        .map((phone) => normalizePhoneToWa(phone))
+        .filter(Boolean)
+    )
+  )
 }
 
 // --- Helpers fechas / días hábiles ---
@@ -1209,11 +1225,14 @@ app.delete('/api/message-templates/:id', async (req, res) => {
 // --------------------------------------------------
 /**
  * POST /api/whatsapp/broadcast
- * body: { plates: ["ABC123", "AA000AA", ...] }
+ * body: {
+ *   plates: ["ABC123", "AA000AA", ...],
+ *   testPhones: ["3572400170", "3512011806"] // opcional, se envían primero
+ * }
  */
 app.post('/api/whatsapp/broadcast', async (req, res) => {
   try {
-    const { plates } = req.body
+    const { plates, testPhones } = req.body || {}
 
     if (!Array.isArray(plates) || plates.length === 0) {
       return res.status(400).json({
@@ -1240,6 +1259,12 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
         .json({ error: 'WhatsApp Cloud API no está configurado en el servidor' })
     }
 
+    const normalizedTestPhones = normalizePhoneListToWa(
+      Object.prototype.hasOwnProperty.call(req.body || {}, 'testPhones')
+        ? testPhones
+        : WHATSAPP_BROADCAST_TEST_PHONES
+    )
+
     // Evitamos ANY(...) y arrays de Postgres para no disparar el 22P02.
     // Hacemos consultas simples por cada patente y armamos un map.
     const vehiclesMap = new Map()
@@ -1257,8 +1282,23 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
 
     const vehicles = Array.from(vehiclesMap.values())
 
+    const testResults = []
     const successes = []
     const errors = []
+
+    for (const phone of normalizedTestPhones) {
+      try {
+        await sendWhatsAppTemplate(phone)
+        testResults.push({ phone, ok: true })
+      } catch (err) {
+        console.error('[WHATSAPP] Error enviando test a', phone, err.message)
+        testResults.push({
+          phone,
+          ok: false,
+          reason: err.message
+        })
+      }
+    }
 
     for (const v of vehicles) {
       const waPhone = normalizePhoneToWa(v.contactPhone)
@@ -1284,12 +1324,18 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
       }
     }
 
+    const testSent = testResults.filter((item) => item.ok).length
+    const testFailed = testResults.length - testSent
+
     res.json({
       ok: true,
       template: WHATSAPP_TEMPLATE,
       language: WHATSAPP_TEMPLATE_LANG,
       sent: successes.length,
       failed: errors.length,
+      testSent,
+      testFailed,
+      testResults,
       successes,
       errors
     })
