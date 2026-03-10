@@ -45,101 +45,6 @@ const one = async (q) => {
   return rows[0] || null
 }
 
-const BROADCAST_LOOKBACK_DAYS = 30
-let broadcastHistorySchemaReady = false
-
-async function ensureBroadcastHistorySchema() {
-  if (broadcastHistorySchemaReady) return
-
-  await sql`
-    CREATE TABLE IF NOT EXISTS "BroadcastHistory" (
-      "id" BIGSERIAL PRIMARY KEY,
-      "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      "createdByUserId" INTEGER NULL,
-      "template" TEXT NULL,
-      "language" TEXT NULL,
-      "requestedPlateCount" INTEGER NOT NULL DEFAULT 0,
-      "processedVehicleCount" INTEGER NOT NULL DEFAULT 0,
-      "sentCount" INTEGER NOT NULL DEFAULT 0,
-      "failedCount" INTEGER NOT NULL DEFAULT 0,
-      "skippedRecentCount" INTEGER NOT NULL DEFAULT 0,
-      "invalidPhoneCount" INTEGER NOT NULL DEFAULT 0,
-      "testSent" INTEGER NOT NULL DEFAULT 0,
-      "testFailed" INTEGER NOT NULL DEFAULT 0,
-      "batchPlates" TEXT NULL,
-      "batchTestPhones" TEXT NULL
-    )
-  `
-
-  await sql`
-    CREATE TABLE IF NOT EXISTS "BroadcastHistoryRecipient" (
-      "id" BIGSERIAL PRIMARY KEY,
-      "historyId" BIGINT NOT NULL REFERENCES "BroadcastHistory"("id") ON DELETE CASCADE,
-      "plate" TEXT NULL,
-      "phone" TEXT NULL,
-      "status" TEXT NOT NULL,
-      "reason" TEXT NULL,
-      "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      "sentAt" TIMESTAMPTZ NULL
-    )
-  `
-
-  await sql`
-    CREATE INDEX IF NOT EXISTS "BroadcastHistory_createdAt_idx"
-    ON "BroadcastHistory" ("createdAt" DESC)
-  `
-
-  await sql`
-    CREATE INDEX IF NOT EXISTS "BroadcastHistoryRecipient_historyId_idx"
-    ON "BroadcastHistoryRecipient" ("historyId")
-  `
-
-  await sql`
-    CREATE INDEX IF NOT EXISTS "BroadcastHistoryRecipient_phone_sentAt_idx"
-    ON "BroadcastHistoryRecipient" ("phone", "sentAt" DESC)
-  `
-
-  broadcastHistorySchemaReady = true
-}
-
-async function insertBroadcastHistoryRecipient({ historyId, plate = null, phone = null, status, reason = null, sentAt = null }) {
-  await sql`
-    INSERT INTO "BroadcastHistoryRecipient" (
-      "historyId",
-      "plate",
-      "phone",
-      "status",
-      "reason",
-      "createdAt",
-      "sentAt"
-    )
-    VALUES (
-      ${historyId},
-      ${plate},
-      ${phone},
-      ${status},
-      ${reason},
-      NOW(),
-      ${sentAt}
-    )
-  `
-}
-
-async function findRecentSuccessfulBroadcastByPhone(phone) {
-  if (!phone) return null
-
-  return one(sql`
-    SELECT "sentAt"
-    FROM "BroadcastHistoryRecipient"
-    WHERE "phone" = ${phone}
-      AND "status" = 'sent'
-      AND "sentAt" IS NOT NULL
-      AND "sentAt" >= NOW() - (${BROADCAST_LOOKBACK_DAYS} * INTERVAL '1 day')
-    ORDER BY "sentAt" DESC
-    LIMIT 1
-  `)
-}
-
 // ------------------------
 // Helpers
 // ------------------------
@@ -1225,44 +1130,6 @@ app.get('/api/message-templates', async (_req, res) => {
   }
 })
 
-app.get('/api/whatsapp/broadcast-history', async (req, res) => {
-  try {
-    await ensureBroadcastHistorySchema()
-
-    if (!req.user) {
-      return res.status(401).json({ error: 'No autenticado' })
-    }
-
-    const rows = await many(sql`
-      SELECT
-        h."id",
-        h."createdAt",
-        h."template",
-        h."language",
-        h."requestedPlateCount",
-        h."processedVehicleCount",
-        h."sentCount",
-        h."failedCount",
-        h."skippedRecentCount",
-        h."invalidPhoneCount",
-        h."testSent",
-        h."testFailed",
-        h."createdByUserId",
-        u.username AS "createdByUsername",
-        u.name AS "createdByName"
-      FROM "BroadcastHistory" h
-      LEFT JOIN "users" u ON u.id = h."createdByUserId"
-      ORDER BY h."createdAt" DESC
-      LIMIT 100
-    `)
-
-    return res.json(rows)
-  } catch (err) {
-    console.error('Error obteniendo historial de WhatsApp masivo:', err)
-    return res.status(500).json({ error: 'Error al obtener el historial de WhatsApp masivo' })
-  }
-})
-
 app.get('/api/message-templates/:id', async (req, res) => {
   try {
     const id = Number(req.params.id)
@@ -1365,7 +1232,6 @@ app.delete('/api/message-templates/:id', async (req, res) => {
  */
 app.post('/api/whatsapp/broadcast', async (req, res) => {
   try {
-    await ensureBroadcastHistorySchema()
     const { plates, testPhones } = req.body || {}
 
     if (!Array.isArray(plates) || plates.length === 0) {
@@ -1416,56 +1282,19 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
 
     const vehicles = Array.from(vehiclesMap.values())
 
-    const history = await one(sql`
-      INSERT INTO "BroadcastHistory" (
-        "createdAt",
-        "createdByUserId",
-        "template",
-        "language",
-        "requestedPlateCount",
-        "batchPlates",
-        "batchTestPhones"
-      )
-      VALUES (
-        NOW(),
-        ${req.user?.userId ?? null},
-        ${WHATSAPP_TEMPLATE},
-        ${WHATSAPP_TEMPLATE_LANG},
-        ${normalizedPlates.length},
-        ${JSON.stringify(normalizedPlates)},
-        ${JSON.stringify(normalizedTestPhones)}
-      )
-      RETURNING "id"
-    `)
-
-    const historyId = history?.id
     const testResults = []
     const successes = []
     const errors = []
-    const skippedRecent = []
-    let invalidPhoneCount = 0
 
     for (const phone of normalizedTestPhones) {
       try {
         await sendWhatsAppTemplate(phone)
         testResults.push({ phone, ok: true })
-        await insertBroadcastHistoryRecipient({
-          historyId,
-          phone,
-          status: 'test_sent',
-          sentAt: new Date()
-        })
       } catch (err) {
         console.error('[WHATSAPP] Error enviando test a', phone, err.message)
         testResults.push({
           phone,
           ok: false,
-          reason: err.message
-        })
-        await insertBroadcastHistoryRecipient({
-          historyId,
-          phone,
-          status: 'test_error',
           reason: err.message
         })
       }
@@ -1475,36 +1304,9 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
       const waPhone = normalizePhoneToWa(v.contactPhone)
       if (!waPhone) {
         console.warn('[WHATSAPP] Vehículo sin teléfono válido:', v.plate)
-        invalidPhoneCount += 1
         errors.push({
           plate: v.plate,
           reason: 'Teléfono inválido o faltante'
-        })
-        await insertBroadcastHistoryRecipient({
-          historyId,
-          plate: v.plate,
-          status: 'invalid_phone',
-          reason: 'Teléfono inválido o faltante'
-        })
-        continue
-      }
-
-      const recentSend = await findRecentSuccessfulBroadcastByPhone(waPhone)
-      if (recentSend) {
-        const lastSentAt = recentSend.sentAt
-        const reason = `Ya se envió un mensaje a este número dentro de los últimos ${BROADCAST_LOOKBACK_DAYS} días`
-        skippedRecent.push({
-          plate: v.plate,
-          phone: waPhone,
-          reason,
-          lastSentAt
-        })
-        await insertBroadcastHistoryRecipient({
-          historyId,
-          plate: v.plate,
-          phone: waPhone,
-          status: 'skipped_recent',
-          reason
         })
         continue
       }
@@ -1512,13 +1314,6 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
       try {
         await sendWhatsAppTemplate(waPhone)
         successes.push({ plate: v.plate, phone: waPhone })
-        await insertBroadcastHistoryRecipient({
-          historyId,
-          plate: v.plate,
-          phone: waPhone,
-          status: 'sent',
-          sentAt: new Date()
-        })
       } catch (err) {
         console.error('[WHATSAPP] Error enviando a', v.plate, err.message)
         errors.push({
@@ -1526,48 +1321,22 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
           phone: waPhone,
           reason: err.message
         })
-        await insertBroadcastHistoryRecipient({
-          historyId,
-          plate: v.plate,
-          phone: waPhone,
-          status: 'error',
-          reason: err.message
-        })
       }
     }
 
     const testSent = testResults.filter((item) => item.ok).length
     const testFailed = testResults.length - testSent
-    const failedCount = errors.length + skippedRecent.length
-
-    await one(sql`
-      UPDATE "BroadcastHistory"
-      SET
-        "processedVehicleCount" = ${vehicles.length},
-        "sentCount" = ${successes.length},
-        "failedCount" = ${failedCount},
-        "skippedRecentCount" = ${skippedRecent.length},
-        "invalidPhoneCount" = ${invalidPhoneCount},
-        "testSent" = ${testSent},
-        "testFailed" = ${testFailed}
-      WHERE "id" = ${historyId}
-      RETURNING "id"
-    `)
 
     res.json({
       ok: true,
-      historyId,
       template: WHATSAPP_TEMPLATE,
       language: WHATSAPP_TEMPLATE_LANG,
       sent: successes.length,
-      failed: failedCount,
-      skippedRecentCount: skippedRecent.length,
-      invalidPhoneCount,
+      failed: errors.length,
       testSent,
       testFailed,
       testResults,
       successes,
-      skippedRecent,
       errors
     })
   } catch (err) {
@@ -1664,12 +1433,4 @@ app.post('/api/whatsapp/send-bulk-text', async (req, res) => {
 // ------------------------
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`)
-
-  ensureBroadcastHistorySchema()
-    .then(() => {
-      console.log('[WHATSAPP] Historial de envíos masivos listo')
-    })
-    .catch((err) => {
-      console.error('[WHATSAPP] No se pudo preparar el historial de envíos masivos:', err.message)
-    })
 })
