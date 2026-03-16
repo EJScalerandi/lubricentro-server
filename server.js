@@ -29,6 +29,10 @@ const WHATSAPP_BROADCAST_TEST_PHONES = [
   '3572400170',
   '3512011806'
 ]
+const WHATSAPP_BROADCAST_BLOCKED = true
+const WHATSAPP_BROADCAST_BLOCK_DELAY_MS = 10000
+const WHATSAPP_BROADCAST_BLOCK_MESSAGE =
+  'el servicio de Meta/api whatsapp no ejecutó la función, motivo: "a payment method must be assigned"'
 
 // ------------------------
 // Base de datos (postgres.js)
@@ -47,6 +51,10 @@ const one = async (q) => {
 
 const BROADCAST_LOOKBACK_DAYS = 30
 let broadcastHistorySchemaReady = false
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
 
 async function ensureBroadcastHistorySchema() {
   if (broadcastHistorySchemaReady) return
@@ -1464,6 +1472,13 @@ app.delete('/api/message-templates/:id', async (req, res) => {
  */
 app.post('/api/whatsapp/broadcast', async (req, res) => {
   try {
+    if (WHATSAPP_BROADCAST_BLOCKED) {
+      await wait(WHATSAPP_BROADCAST_BLOCK_DELAY_MS)
+      return res.status(503).json({
+        error: WHATSAPP_BROADCAST_BLOCK_MESSAGE
+      })
+    }
+
     await ensureBroadcastHistorySchema()
     const { plates, testPhones, templateName } = req.body || {}
     const selectedTemplate = getBroadcastTemplateConfig(templateName)
@@ -1711,6 +1726,13 @@ app.post('/webhook/whatsapp', (req, res) => {
 // ------------------------
 app.post('/api/whatsapp/send-bulk-text', async (req, res) => {
   try {
+    if (WHATSAPP_BROADCAST_BLOCKED) {
+      await wait(WHATSAPP_BROADCAST_BLOCK_DELAY_MS)
+      return res.status(503).json({
+        error: WHATSAPP_BROADCAST_BLOCK_MESSAGE
+      })
+    }
+
     if (!WHATSAPP_ENABLED) {
       return res.status(400).json({ error: 'WhatsApp está deshabilitado en el servidor' })
     }
