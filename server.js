@@ -204,6 +204,90 @@ function normalizePhoneListToWa(phones) {
   )
 }
 
+function formatDateForWhatsAppTemplate(value) {
+  if (!value) return 'sin fecha'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return 'sin fecha'
+  return date.toLocaleDateString('es-AR')
+}
+
+function sanitizeContactName(name) {
+  const raw = String(name || '').trim()
+  if (!raw) return 'estimado cliente'
+
+  const normalized = raw
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9]/g, '')
+
+  const invalidNames = new Set(['no', 'nose', 'ns', 'na', 'sinnombre'])
+  return invalidNames.has(normalized) ? 'estimado cliente' : raw
+}
+
+function buildTemplateTextParameter(value, fallback) {
+  const trimmed = String(value ?? '').trim()
+  if (trimmed) return trimmed
+  return fallback
+}
+
+const WHATSAPP_BROADCAST_TEMPLATES = {
+  recordatorio_de_ubicacion: {
+    name: 'recordatorio_de_ubicacion',
+    label: 'Recordatorio de ubicación / acceso',
+    buildParameters: () => []
+  },
+  recordatorio_service: {
+    name: 'recordatorio_service',
+    label: 'Recordatorio service',
+    buildParameters: (vehicle = {}) => [
+      buildTemplateTextParameter(vehicle.brand, 'tu vehículo'),
+      buildTemplateTextParameter(vehicle.model, 'sin modelo'),
+      buildTemplateTextParameter(vehicle.plate, 'sin patente'),
+      formatDateForWhatsAppTemplate(vehicle.lastService)
+    ]
+  },
+  agradecer_visita: {
+    name: 'agradecer_visita',
+    label: 'Gracias por tu visita',
+    buildParameters: (vehicle = {}) => [
+      sanitizeContactName(vehicle.contactName),
+      buildTemplateTextParameter(vehicle.brand, 'tu vehículo'),
+      buildTemplateTextParameter(vehicle.model, 'sin modelo'),
+      buildTemplateTextParameter(vehicle.plate, 'sin patente')
+    ]
+  },
+  promo_marzo: {
+    name: 'promo_marzo',
+    label: 'Promo especial lubricentro',
+    buildParameters: () => []
+  }
+}
+
+function getBroadcastTemplateConfig(templateName) {
+  const normalizedName = String(templateName || '').trim()
+  return (
+    WHATSAPP_BROADCAST_TEMPLATES[normalizedName] ||
+    WHATSAPP_BROADCAST_TEMPLATES[WHATSAPP_TEMPLATE] ||
+    WHATSAPP_BROADCAST_TEMPLATES.recordatorio_de_ubicacion
+  )
+}
+
+function buildWhatsAppTemplateComponents(templateConfig, vehicle) {
+  const parameters = templateConfig.buildParameters(vehicle)
+  if (!parameters.length) return undefined
+
+  return [
+    {
+      type: 'body',
+      parameters: parameters.map((value) => ({
+        type: 'text',
+        text: String(value)
+      }))
+    }
+  ]
+}
+
 // --- Helpers fechas / días hábiles ---
 
 // feriados fijos (mes-día).
@@ -367,28 +451,42 @@ async function computeVehicleCategory(plate) {
 // ------------------------
 // Helper para WhatsApp Cloud API (plantilla)
 // ------------------------
-function sendWhatsAppTemplate(to) {
+function sendWhatsAppTemplate(to, templateName, vehicle = null) {
   return new Promise((resolve, reject) => {
+    const templateConfig = getBroadcastTemplateConfig(templateName)
+    const components = buildWhatsAppTemplateComponents(templateConfig, vehicle)
+
     if (!WHATSAPP_ENABLED) {
-      console.log('[WHATSAPP] Deshabilitado. Simulando envío a:', to)
-      return resolve({ simulated: true })
+      console.log(
+        '[WHATSAPP] Deshabilitado. Simulando envío a:',
+        to,
+        'template:',
+        templateConfig.name,
+        'components:',
+        components
+      )
+      return resolve({ simulated: true, template: templateConfig.name, components })
     }
     if (!WHATSAPP_PHONE_NUMBER_ID || !WHATSAPP_TOKEN) {
       return reject(new Error('WhatsApp API no configurada correctamente'))
+    }
+
+    const templatePayload = {
+      name: templateConfig.name,
+      language: {
+        code: WHATSAPP_TEMPLATE_LANG
+      }
+    }
+
+    if (components) {
+      templatePayload.components = components
     }
 
     const payload = JSON.stringify({
       messaging_product: 'whatsapp',
       to,
       type: 'template',
-      template: {
-        name: WHATSAPP_TEMPLATE,
-        language: {
-          code: WHATSAPP_TEMPLATE_LANG
-        }
-        // Si tu plantilla usa variables, acá se agregan "components"
-        // components: [...]
-      }
+      template: templatePayload
     })
 
     const options = {
@@ -1360,13 +1458,15 @@ app.delete('/api/message-templates/:id', async (req, res) => {
  * POST /api/whatsapp/broadcast
  * body: {
  *   plates: ["ABC123", "AA000AA", ...],
- *   testPhones: ["3572400170", "3512011806"] // opcional, se envían primero
+ *   testPhones: ["3572400170", "3512011806"], // opcional, se envían primero
+ *   templateName: "recordatorio_de_ubicacion" // opcional
  * }
  */
 app.post('/api/whatsapp/broadcast', async (req, res) => {
   try {
     await ensureBroadcastHistorySchema()
-    const { plates, testPhones } = req.body || {}
+    const { plates, testPhones, templateName } = req.body || {}
+    const selectedTemplate = getBroadcastTemplateConfig(templateName)
 
     if (!Array.isArray(plates) || plates.length === 0) {
       return res.status(400).json({
@@ -1405,7 +1505,7 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
 
     for (const plate of normalizedPlates) {
       const rows = await many(sql`
-        SELECT "plate", "contactPhone"
+        SELECT "plate", "contactPhone", "contactName", "brand", "model", "lastService"
         FROM "Vehicle"
         WHERE "plate" = ${plate}
       `)
@@ -1415,6 +1515,7 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
     }
 
     const vehicles = Array.from(vehiclesMap.values())
+    const sampleVehicle = vehicles[0] || { plate: normalizedPlates[0] || null }
 
     const history = await one(sql`
       INSERT INTO "BroadcastHistory" (
@@ -1429,7 +1530,7 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
       VALUES (
         NOW(),
         ${req.user?.userId ?? null},
-        ${WHATSAPP_TEMPLATE},
+        ${selectedTemplate.name},
         ${WHATSAPP_TEMPLATE_LANG},
         ${normalizedPlates.length},
         ${JSON.stringify(normalizedPlates)},
@@ -1447,7 +1548,7 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
 
     for (const phone of normalizedTestPhones) {
       try {
-        await sendWhatsAppTemplate(phone)
+        await sendWhatsAppTemplate(phone, selectedTemplate.name, sampleVehicle)
         testResults.push({ phone, ok: true })
         await insertBroadcastHistoryRecipient({
           historyId,
@@ -1510,7 +1611,7 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
       }
 
       try {
-        await sendWhatsAppTemplate(waPhone)
+        await sendWhatsAppTemplate(waPhone, selectedTemplate.name, v)
         successes.push({ plate: v.plate, phone: waPhone })
         await insertBroadcastHistoryRecipient({
           historyId,
@@ -1557,7 +1658,7 @@ app.post('/api/whatsapp/broadcast', async (req, res) => {
     res.json({
       ok: true,
       historyId,
-      template: WHATSAPP_TEMPLATE,
+      template: selectedTemplate.name,
       language: WHATSAPP_TEMPLATE_LANG,
       sent: successes.length,
       failed: failedCount,
