@@ -29,13 +29,9 @@ const WHATSAPP_BROADCAST_TEST_PHONES = [
   '3572400170',
   '3512011806'
 ]
-const WHATSAPP_BROADCAST_BLOCKED =
-  process.env.WHATSAPP_BROADCAST_BLOCKED === 'true'
-const WHATSAPP_BROADCAST_BLOCK_DELAY_MS = Number(
-  process.env.WHATSAPP_BROADCAST_BLOCK_DELAY_MS || 10000
-)
+const WHATSAPP_BROADCAST_BLOCKED = process.env.WHATSAPP_BROADCAST_BLOCKED === 'true'
+const WHATSAPP_BROADCAST_BLOCK_DELAY_MS = 10000
 const WHATSAPP_BROADCAST_BLOCK_MESSAGE =
-  process.env.WHATSAPP_BROADCAST_BLOCK_MESSAGE ||
   'el servicio de Meta/api whatsapp no ejecutó la función, motivo: "a payment method must be assigned"'
 
 // ------------------------
@@ -272,6 +268,11 @@ const WHATSAPP_BROADCAST_TEMPLATES = {
   promo_marzo: {
     name: 'promo_marzo',
     label: 'Promo especial lubricentro',
+    buildParameters: () => []
+  },
+  promo_abril_mayo: {
+    name: 'promo_abril_mayo',
+    label: 'Promo abril / mayo',
     buildParameters: () => []
   }
 }
