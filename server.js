@@ -270,8 +270,8 @@ const WHATSAPP_BROADCAST_TEMPLATES = {
     label: 'Promo especial lubricentro',
     buildParameters: () => []
   },
-  promo_abril_mayo: {
-    name: 'promo_abril_mayo',
+  promo_abrilymayo: {
+    name: 'promo_abrilymayo',
     label: 'Promo abril / mayo',
     buildParameters: () => []
   }
